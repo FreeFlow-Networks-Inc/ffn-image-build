@@ -235,15 +235,31 @@ stop_arrays_on(){
 	done
 }
 
-part_os(){   # $1 = disk, $2 = end of partition 1, $3 = end of partition 2
+# Partition numbers, named once so the shift from the old msdos layout cannot
+# be got wrong in one place and not another. p1 is the BIOS boot partition.
+OS_P_BIOS=1
+OS_P_ROOT=2
+OS_P_RECOVERY=3
+
+part_os(){   # $1 = disk, $2 = end of the root partition, $3 = end of recovery
 	wipefs -a "$1"
-	parted -s "$1" mklabel msdos
-	parted -s "$1" mkpart primary ext4 1MiB "$2"
+	# GPT, not msdos. On a GPT disk there is no post-MBR gap for core.img, so
+	# BIOS-mode GRUB needs a 1 MiB ef02 partition or grub-install --target=i386-pc
+	# fails. It gets NO filesystem: GRUB writes raw bytes there, and an mkfs on it
+	# breaks the boot.
+	#
+	# It is also deliberately NOT a RAID member. GRUB writes it per disk, so each
+	# disk carries its own copy and the box still boots with either one pulled --
+	# which is the whole reason for the mirror. Inside the array, core.img would
+	# have to be read through an md that is not assembled yet.
+	parted -s "$1" mklabel gpt
+	parted -s "$1" mkpart bios_grub 1MiB 2MiB
+	parted -s "$1" set $OS_P_BIOS bios_grub on
+	parted -s "$1" mkpart primary ext4 2MiB "$2"
 	parted -s "$1" mkpart primary ext4 "$2" "$3"
-	parted -s "$1" set 1 boot on
 	if [ "$OS_RAID" = 1 ]; then
-		parted -s "$1" set 1 raid on
-		parted -s "$1" set 2 raid on
+		parted -s "$1" set $OS_P_ROOT raid on
+		parted -s "$1" set $OS_P_RECOVERY raid on
 	fi
 	partprobe "$1"; sleep 2
 }
@@ -252,7 +268,7 @@ part_os(){   # $1 = disk, $2 = end of partition 1, $3 = end of partition 2
 stop_arrays_on "${OS_DISKS[@]}"
 if [ "$OS_RAID" = 1 ]; then
 	for d in "${OS_DISKS[@]}"; do
-		for n in 1 2; do mdadm --zero-superblock "$(pname "$d" "$n")" >/dev/null 2>&1 || true; done
+		for n in $OS_P_ROOT $OS_P_RECOVERY; do mdadm --zero-superblock "$(pname "$d" "$n")" >/dev/null 2>&1 || true; done
 	done
 	# Identical explicit sizes derived from the SMALLER disk. The two SSDs in a
 	# reclaimed chassis are usually different models and differ by a few MB;
@@ -267,21 +283,21 @@ if [ "$OS_RAID" = 1 ]; then
 	done
 	USABLE_MIB=$(( SMALL / 1048576 - 64 ))
 	[ "$USABLE_MIB" -gt 12288 ] || die "OS disks too small: ${USABLE_MIB}MiB usable"
-	echo "-- partitioning ${OS_DISKS[*]} (MBR, RAID members; ${USABLE_MIB}MiB usable) --"
+	echo "-- partitioning ${OS_DISKS[*]} (GPT, RAID members; ${USABLE_MIB}MiB usable) --"
 	for d in "${OS_DISKS[@]}"; do part_os "$d" "9216MiB" "${USABLE_MIB}MiB"; done
 	echo "-- creating OS mirrors (metadata 1.0) --"
 	mdadm --create --run --verbose /dev/md0 --level=1 --raid-devices=2 \
 	      --metadata=1.0 --homehost=ffn --name=ffn-root \
-	      "$(pname "${OS_DISKS[0]}" 1)" "$(pname "${OS_DISKS[1]}" 1)"
+	      "$(pname "${OS_DISKS[0]}" $OS_P_ROOT)" "$(pname "${OS_DISKS[1]}" $OS_P_ROOT)"
 	mdadm --create --run --verbose /dev/md1 --level=1 --raid-devices=2 \
 	      --metadata=1.0 --homehost=ffn --name=ffn-recovery \
-	      "$(pname "${OS_DISKS[0]}" 2)" "$(pname "${OS_DISKS[1]}" 2)"
+	      "$(pname "${OS_DISKS[0]}" $OS_P_RECOVERY)" "$(pname "${OS_DISKS[1]}" $OS_P_RECOVERY)"
 	P1=/dev/md0; P2=/dev/md1
 else
-	echo "-- partitioning ${OS_DISKS[0]} (MBR: main root + recovery) --"
+	echo "-- partitioning ${OS_DISKS[0]} (GPT: bios_grub + root + recovery) --"
 	part_os "${OS_DISKS[0]}" 9GiB 100%
-	P1=$(pname "${OS_DISKS[0]}" 1)
-	P2=$(pname "${OS_DISKS[0]}" 2)
+	P1=$(pname "${OS_DISKS[0]}" $OS_P_ROOT)
+	P2=$(pname "${OS_DISKS[0]}" $OS_P_RECOVERY)
 fi
 
 mkfs.ext4 -q -F -L ffn-root     "$P1"
@@ -382,7 +398,7 @@ if [ "$OS_RAID" = 1 ]; then
 	# GRUB goes on BOTH disks so the box still boots with either one pulled.
 	# That is the entire point of the mirror.
 	for d in "${OS_DISKS[@]}"; do
-		grub-install --target=i386-pc --modules="mdraid1x part_msdos ext2" \
+		grub-install --target=i386-pc --modules="mdraid1x part_gpt ext2" \
 		             --boot-directory="$MNT/boot" "$d"
 	done
 else
