@@ -185,7 +185,7 @@ if [ -f /factory-running-config.xml ]; then
   echo "  factory config: model-specific (harvested build-host config discarded)"
 elif [ -f /var/lib/ffn-ngfw/config/running-config.xml ]; then
   cp /var/lib/ffn-ngfw/config/running-config.xml /etc/ffn-ngfw/factory/running-config.xml
-  echo "  WARNING: no profiles/${FFN_MODEL}.running-config.xml -- this image"
+  echo "  WARNING: no profiles/${FFN_MODEL:-<unset>}.running-config.xml -- this image"
   echo "           inherits the BUILD HOST identity as its factory default"
 fi
 
