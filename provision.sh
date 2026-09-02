@@ -138,6 +138,20 @@ if [ -n "${FFN_ROOT_PW:-}" ]; then
   echo "root:${FFN_ROOT_PW}" | chpasswd
   echo "${ADMIN_USER}:${FFN_ROOT_PW}" | chpasswd
   echo "  set password for root + ${ADMIN_USER}"
+  # Expire it immediately so the shipped default is SINGLE USE. Every unit built
+  # from one image otherwise shares a password, and provision.sh sets no sshd
+  # policy, so Ubuntu's PasswordAuthentication=yes applies and the default would
+  # work over the network on the admin account. PAM forces a change at the first
+  # login instead -- for root directly, and for ${ADMIN_USER} before the ffn-cli
+  # shell is reached.
+  #
+  # A failure here is warned about, not fatal: an image that boots with a live
+  # password beats no image, but the operator has to know to expire it by hand.
+  if passwd -e root >/dev/null 2>&1 && passwd -e "${ADMIN_USER}" >/dev/null 2>&1; then
+    echo "  expired both -- first login MUST set a new password"
+  else
+    echo "  WARNING: could not expire the default password; it is live until changed"
+  fi
 else
   echo "  WARNING: FFN_ROOT_PW empty -- no console login will be possible"
 fi
