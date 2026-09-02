@@ -1,0 +1,17 @@
+[Unit]
+Description=FFN NGFW Data Plane (reworked DPDK 22.11 zygote — replaces ffn-dpdk-runtime)
+After=network.target
+[Service]
+Type=simple
+WorkingDirectory=/opt/ffn-ngfw-v2/dpdk
+Environment=LD_LIBRARY_PATH=/opt/dpdk-22.11/lib/x86_64-linux-gnu
+# hugepages; ASLR is self-managed per-process by the zygote (ADDR_NO_RANDOMIZE + re-exec)
+ExecStartPre=/bin/sh -c 'echo 2048 > /proc/sys/vm/nr_hugepages'
+ExecStartPre=/bin/sh -c 'mkdir -p /mnt/huge && (mountpoint -q /mnt/huge || mount -t hugetlbfs -o pagesize=2M nodev /mnt/huge)'
+ExecStartPre=-/sbin/ip link set eno2np1 up
+ExecStart=/opt/ffn-ngfw-v2/dpdk/ffn-dpdk-mp -l 12-13 --file-prefix=ffndp \
+  --vdev=net_af_xdp0,iface=eno2np1 -- --tables /var/lib/ffn-ngfw/fastpath
+Restart=on-failure
+RestartSec=5
+[Install]
+WantedBy=multi-user.target

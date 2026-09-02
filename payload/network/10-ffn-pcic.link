@@ -1,0 +1,13 @@
+# FFN NGFW: keep the PCIC interface's driver-assigned name.
+#
+# Without this, systemd's predictable-naming policy renames pcicp0 to enp1s0f0
+# after the driver registers it, which is actively unhelpful here: the PCIe
+# "NIC" is not a NIC on a slot, it is the MP's link to the control plane, and
+# there will be a second PCIC hop (CP<->DP) to tell apart from it. The
+# bus-derived name says where the endpoint sits; pcicp0 says what it connects
+# to, which is the thing anyone reading a rule or a capture needs to know.
+[Match]
+Driver=ffn_pcic
+
+[Link]
+NamePolicy=keep

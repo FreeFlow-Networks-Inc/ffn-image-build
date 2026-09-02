@@ -1,0 +1,205 @@
+--- install-to-disk.sh	2026-08-24 21:27:17.314150614 +0000
++++ install-to-disk.sh.raid1-proposed	2026-08-26 23:54:20.602010166 +0000
+@@ -1,11 +1,13 @@
+ #!/usr/bin/env bash
+ # FFN NGFW bare-metal installer. Boot the target from any Ubuntu live USB, then:
+-#   sudo ./install-to-disk.sh /dev/sdX
++#   sudo ./install-to-disk.sh /dev/sdX            # single disk
++#   sudo ./install-to-disk.sh /dev/sdX /dev/sdY   # RAID1 mirror across two disks
+ # (expects <ver>-rootfs.tar.zst + <ver>-recovery.tar.zst alongside this script)
+-# WIPES the target disk and lays down TWO partitions: main root + recovery/maintenance.
++# WIPES the target disk(s) and lays down TWO partitions: main root + recovery/maintenance.
+ # First boot self-provisions. FIPS-CC is toggled only from the recovery partition.
+ set -euo pipefail
+ DISK="${1:-}"
++DISK2="${2:-}"
+ HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+ ROOTFS_TAR=$(ls "$HERE"/*-rootfs.tar.zst 2>/dev/null | head -1)
+ RECOVERY_TAR=$(ls "$HERE"/*-recovery.tar.zst 2>/dev/null | head -1)
+@@ -16,24 +18,102 @@
+ FFN_SERIAL_BAUD="${FFN_SERIAL_BAUD:-115200}"
+ 
+ [ "$(id -u)" = 0 ] || die "run as root"
+-[ -b "$DISK" ] || die "usage: $0 /dev/sdX   (target disk not a block device)"
++[ -b "$DISK" ] || die "usage: $0 /dev/sdX [/dev/sdY]   (target disk not a block device)"
+ [ -f "$ROOTFS_TAR" ]   || die "rootfs tarball not found next to this script"
+ [ -f "$RECOVERY_TAR" ] || die "recovery tarball not found next to this script"
+ command -v zstd >/dev/null || die "install zstd first (apt install zstd)"
+ command -v grub-install >/dev/null || die "install grub-pc-bin first"
+ 
+-echo "!!! This ERASES $DISK :"; lsblk "$DISK"
++# ---- RAID1 mode -------------------------------------------------------------
++# Two disks => mirror both partitions. Chosen defaults and why:
++#   metadata=1.0  -- superblock lives at the END of the member, so the ext4
++#                    filesystem still starts at offset 0. GRUB, blkid and
++#                    e2fsck therefore read a mirror member as an ordinary
++#                    partition even with no RAID support present. 1.2 (mdadm's
++#                    default) puts the superblock 4K in and makes /boot depend
++#                    on GRUB's mdraid1x module loading correctly.
++#   fixed sizes   -- the two SSDs in a reclaimed chassis are usually different
++#                    models (e.g. INTEL SSDSC2KB240G8 vs CT240BX500SSD1) and
++#                    differ by a few MB. "100%" would then build mismatched
++#                    members and mdadm would size the array to the smaller one
++#                    anyway, wasting the difference and making a later disk
++#                    swap fail if the replacement is smaller still. So both
++#                    disks get identical explicit partition sizes derived from
++#                    the SMALLER disk, with headroom left at the end.
++RAID=0
++if [ -n "$DISK2" ]; then
++  [ -b "$DISK2" ] || die "second target $DISK2 is not a block device"
++  [ "$DISK" != "$DISK2" ] || die "the two targets must be different disks"
++  command -v mdadm >/dev/null || die "install mdadm first (apt install mdadm)"
++  RAID=1
++fi
++
++if [ "$RAID" = 1 ]; then
++  echo "!!! This ERASES BOTH $DISK and $DISK2 :"; lsblk "$DISK" "$DISK2"
++else
++  echo "!!! This ERASES $DISK :"; lsblk "$DISK"
++fi
+ read -rp "Type ERASE to continue: " a; [ "$a" = "ERASE" ] || die "aborted"
+ 
+-echo "-- partitioning $DISK (MBR: main root + recovery) --"
+-wipefs -a "$DISK"
+-parted -s "$DISK" mklabel msdos
+-parted -s "$DISK" mkpart primary ext4 1MiB 9GiB
+-parted -s "$DISK" mkpart primary ext4 9GiB 100%
+-parted -s "$DISK" set 1 boot on
+-partprobe "$DISK"; sleep 2
+-P1="${DISK}1"; [ -b "$P1" ] || P1="${DISK}p1"
+-P2="${DISK}2"; [ -b "$P2" ] || P2="${DISK}p2"
++part_one(){   # $1 = disk, $2 = end of partition 1, $3 = end of partition 2
++  wipefs -a "$1"
++  parted -s "$1" mklabel msdos
++  parted -s "$1" mkpart primary ext4 1MiB "$2"
++  parted -s "$1" mkpart primary ext4 "$2" "$3"
++  parted -s "$1" set 1 boot on
++  if [ "$RAID" = 1 ]; then
++    parted -s "$1" set 1 raid on
++    parted -s "$1" set 2 raid on
++  fi
++  partprobe "$1"; sleep 2
++}
++pname(){ local p="${1}${2}"; [ -b "$p" ] || p="${1}p${2}"; echo "$p"; }
++
++if [ "$RAID" = 1 ]; then
++  # Stop only arrays that actually have a member on one of the TARGET disks.
++  # "mdadm --stop --scan" would stop every array on the system, which on a box
++  # with the 2TB log mirror assembled (md9) would tear that down too -- not
++  # something an installer aimed at two SSDs has any business doing.
++  for d in "$DISK" "$DISK2"; do
++    base=$(basename "$d")
++    for md in /sys/block/md*; do
++      [ -d "$md" ] || continue
++      if ls "$md"/slaves 2>/dev/null | grep -q "^${base}[0-9p]*$"; then
++        echo "-- stopping /dev/$(basename "$md") (has a member on $d) --"
++        mdadm --stop "/dev/$(basename "$md")" >/dev/null 2>&1 || true
++      fi
++    done
++  done
++  for d in "$DISK" "$DISK2"; do
++    for n in 1 2; do mdadm --zero-superblock "$(pname "$d" "$n")" >/dev/null 2>&1 || true; done
++  done
++  SZ1=$(blockdev --getsize64 "$DISK")
++  SZ2=$(blockdev --getsize64 "$DISK2")
++  SMALL=$(( SZ1 < SZ2 ? SZ1 : SZ2 ))
++  # leave 64MiB of slack at the end so a slightly smaller replacement disk
++  # can still join the array later
++  USABLE_MIB=$(( SMALL / 1048576 - 64 ))
++  [ "$USABLE_MIB" -gt 12288 ] || die "disks too small: ${USABLE_MIB}MiB usable"
++  P1_END_MIB=9216                      # 9GiB, matching the single-disk layout
++  echo "-- partitioning $DISK and $DISK2 (MBR, RAID members; ${USABLE_MIB}MiB usable) --"
++  part_one "$DISK"  "${P1_END_MIB}MiB" "${USABLE_MIB}MiB"
++  part_one "$DISK2" "${P1_END_MIB}MiB" "${USABLE_MIB}MiB"
++
++  A1=$(pname "$DISK" 1);  A2=$(pname "$DISK" 2)
++  B1=$(pname "$DISK2" 1); B2=$(pname "$DISK2" 2)
++  echo "-- creating mirrors (metadata 1.0) --"
++  mdadm --create --run --verbose /dev/md0 --level=1 --raid-devices=2 \
++        --metadata=1.0 --homehost=ffn --name=ffn-root     "$A1" "$B1"
++  mdadm --create --run --verbose /dev/md1 --level=1 --raid-devices=2 \
++        --metadata=1.0 --homehost=ffn --name=ffn-recovery "$A2" "$B2"
++  P1=/dev/md0; P2=/dev/md1
++else
++  echo "-- partitioning $DISK (MBR: main root + recovery) --"
++  part_one "$DISK" 9GiB 100%
++  P1=$(pname "$DISK" 1)
++  P2=$(pname "$DISK" 2)
++fi
++
+ mkfs.ext4 -q -F -L ffn-root     "$P1"
+ mkfs.ext4 -q -F -L ffn-recovery "$P2"
+ 
+@@ -43,23 +123,70 @@
+ 
+ echo "-- installing GRUB (main + recovery entries) --"
+ KVER=$(ls "$MNT/boot"/vmlinuz-* | sed 's#.*/vmlinuz-##' | sort | tail -1)
++# Locate recovery by LABEL rather than a hardcoded (hd0,msdos2): under RAID the
++# recovery mirror is not on hd0 in any fixed sense, and search also survives a
++# disk being pulled or the BIOS renumbering drives.
+ cat > "$MNT/etc/grub.d/40_custom" <<EOF
+ #!/bin/sh
+ exec tail -n +3 \$0
+ menuentry 'FFN NGFW Recovery / Maintenance' --class ffn {
+-  set root=(hd0,msdos2)
++  search --no-floppy --label --set=root ffn-recovery
+   linux /boot/vmlinuz-$KVER root=LABEL=ffn-recovery ro console=tty0 console=ttyS0,${FFN_SERIAL_BAUD}n8
+   initrd /boot/initrd.img-$KVER
+ }
+ EOF
+ chmod +x "$MNT/etc/grub.d/40_custom"
+ grep -q GRUB_DISABLE_OS_PROBER "$MNT/etc/default/grub" || echo "GRUB_DISABLE_OS_PROBER=true" >> "$MNT/etc/default/grub"
++
++# GRUB draws its menu as a full 80x25 repaint on every countdown tick. On an
++# appliance console at 9600 baud that is ~2000 characters, about two seconds per
++# tick, which is why the menu crawls and the countdown stutters. Hiding the menu
++# removes the repaint entirely (hold Esc or Shift to get it back) and does NOT
++# suppress kernel output -- FFN deliberately leaves 'quiet' unset so boot
++# progress stays visible on serial, and verify-image.sh checks that.
++grep -q '^GRUB_TIMEOUT_STYLE=' "$MNT/etc/default/grub" \
++  || echo 'GRUB_TIMEOUT_STYLE=hidden' >> "$MNT/etc/default/grub"
++sed -i 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=1/' "$MNT/etc/default/grub"
++grep -q '^GRUB_TIMEOUT=' "$MNT/etc/default/grub" \
++  || echo 'GRUB_TIMEOUT=1' >> "$MNT/etc/default/grub"
++
+ mount -t proc proc "$MNT/proc"; mount -t sysfs sys "$MNT/sys"; mount --rbind /dev "$MNT/dev"
+-grub-install --target=i386-pc --boot-directory="$MNT/boot" "$DISK"
++
++if [ "$RAID" = 1 ]; then
++  # The initramfs has to assemble the mirror before it can mount root, so the
++  # array definition must exist inside the image and the initrd be rebuilt.
++  mkdir -p "$MNT/etc/mdadm"
++  {
++    echo "HOMEHOST <ignore>"
++    mdadm --detail --scan
++  } > "$MNT/etc/mdadm/mdadm.conf"
++  chroot "$MNT" sh -c 'command -v update-initramfs >/dev/null' \
++    || die "target image has no update-initramfs; cannot build a RAID-capable initrd"
++  chroot "$MNT" update-initramfs -u -k all
++  # core.img must be able to read a 1.x superblock member before the initrd
++  # exists, and GRUB goes on BOTH disks so the box still boots with either one
++  # pulled. This is the whole point of the mirror.
++  for d in "$DISK" "$DISK2"; do
++    grub-install --target=i386-pc --modules="mdraid1x part_msdos ext2" \
++                 --boot-directory="$MNT/boot" "$d"
++  done
++else
++  grub-install --target=i386-pc --boot-directory="$MNT/boot" "$DISK"
++fi
++
+ chroot "$MNT" grub-mkconfig -o /boot/grub/grub.cfg
+ umount -R "$MNT/dev" 2>/dev/null || true; umount "$MNT/sys" "$MNT/proc" 2>/dev/null || true
+ umount "$MNT" "$MNT2"; rmdir "$MNT" "$MNT2"
+ 
++if [ "$RAID" = 1 ]; then
++  echo "-- mirror status (initial sync runs in the background after boot) --"
++  cat /proc/mdstat
++fi
++
+ echo "DONE. Reboot into the appliance."
+ echo "  Normal boot  -> FFN NGFW (first boot self-provisions; WebUI https://<dhcp-ip>:8443)."
+ echo "  Recovery     -> pick 'FFN NGFW Recovery / Maintenance' in GRUB to enable/disable FIPS-CC (wipes config)."
++if [ "$RAID" = 1 ]; then
++  echo "  RAID1        -> /dev/md0 = ffn-root, /dev/md1 = ffn-recovery, GRUB on both disks."
++  echo "                  Check with: cat /proc/mdstat ; mdadm --detail /dev/md0"
++fi

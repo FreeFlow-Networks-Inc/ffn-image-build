@@ -1,0 +1,48 @@
+[Unit]
+Description=FFN NGFW Control Plane Daemon
+After=network.target
+Wants=network.target
+Before=ffn-manager.service ffn-configd.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/ffn-ngfw
+Environment=FFN_CONFIG_DIR=/var/lib/ffn-ngfw/config
+Environment=FFN_RUN_DIR=/var/run/ffn-ngfw
+Environment=FFN_CONTROLD_SOCKET=/var/run/ffn-ngfw/controld.sock
+Environment=FFN_CONTROLD_GROUP=ffn-mgmt
+Environment=FFN_NGFW_DEV=/dev/ngfw0
+Environment=FFN_DPDK_SOCKET=/var/run/ffn-ngfw/dpdk.sock
+RuntimeDirectory=ffn-ngfw
+RuntimeDirectoryMode=0755
+# Shared with ffn-dpd. Preserve across sibling restarts so one service
+# restarting doesn't blow away the other's socket.
+RuntimeDirectoryPreserve=yes
+
+ExecStart=/opt/ffn-ngfw/venv/bin/python3 /opt/ffn-ngfw/ffn_controld.py
+Restart=on-failure
+RestartSec=3
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/ffn-ngfw /var/log/ffn-ngfw /var/run/ffn-ngfw
+PrivateTmp=true
+DeviceAllow=/dev/ngfw0 rw
+
+# Needs netlink + unix sockets + TCP for any subprocess that makes API calls
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE
+SystemCallArchitectures=native
+
+LimitNOFILE=8192
+
+[Install]
+WantedBy=multi-user.target

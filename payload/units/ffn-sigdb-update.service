@@ -1,0 +1,23 @@
+[Unit]
+Description=FFN NGFW Signature Database Updater
+After=ffn-manager.service network-online.target
+Wants=network-online.target
+Requires=ffn-manager.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/ffn-ngfw/bin/ffn-sigdb-update
+SyslogIdentifier=ffn-sigdb-update
+StandardOutput=journal
+StandardError=journal
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/ffn-ngfw /var/log/ffn-ngfw
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

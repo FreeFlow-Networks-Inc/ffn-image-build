@@ -1,0 +1,39 @@
+[Unit]
+Description=FFN NGFW Configuration Daemon (XML applier)
+After=network-pre.target ffn-controld.service
+Wants=network-pre.target
+Before=ffn-manager.service
+
+[Service]
+Type=simple
+# Runs as root — only this daemon writes to /dev/ngfw0 and touches sshd config
+User=root
+Group=root
+WorkingDirectory=/opt/ffn-ngfw
+Environment=FFN_CONFIG_DIR=/var/lib/ffn-ngfw/config
+Environment=FFN_CONFIG_SCHEMA=/etc/ffn-ngfw/ffn-config.xsd
+Environment=FFN_NGFW_DEV=/dev/ngfw0
+Environment=FFN_DPDK_SOCKET=/var/run/ffn-ngfw/dpdk.sock
+ExecStart=/opt/ffn-ngfw/venv/bin/python3 /opt/ffn-ngfw/ffn_configd.py
+Restart=on-failure
+RestartSec=3
+
+# Hardening — still root but reduce blast radius
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/ffn-ngfw /var/log/ffn-ngfw /var/run/ffn-ngfw /var/lib/dhcp /etc/systemd/timesyncd.conf.d /etc/ssh/sshd_config.d /etc/ffn-ngfw /etc/resolv.conf
+PrivateTmp=true
+DeviceAllow=/dev/ngfw0 rw
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER
+SystemCallArchitectures=native
+
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

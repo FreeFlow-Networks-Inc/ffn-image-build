@@ -1,0 +1,20 @@
+[Unit]
+Description=FFN NGFW License Expiry Monitor (daily check)
+After=ffn-manager.service
+Requires=ffn-manager.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/ffn-ngfw/bin/ffn-license-monitor
+SyslogIdentifier=ffn-license-monitor
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/log/ffn-ngfw
+PrivateTmp=yes
+PrivateDevices=yes
+
+[Install]
+WantedBy=multi-user.target

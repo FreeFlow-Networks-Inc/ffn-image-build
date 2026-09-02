@@ -1,0 +1,14 @@
+[Unit]
+Description=FFN NGFW Management Server (reworked stack v2)
+After=network.target frr.service
+[Service]
+Type=simple
+WorkingDirectory=/opt/ffn-ngfw-v2
+Environment=FFN_DB_PATH=/var/lib/ffn-ngfw/config-v2.db
+Environment=FFN_CONFIG_DIR=/var/lib/ffn-ngfw/config-v2
+Environment=FFN_MGMT_IFACE=eno1np0
+ExecStart=/opt/ffn-ngfw-v2/venv/bin/uvicorn ffn_manager:app --host 0.0.0.0 --port 8443 --app-dir /opt/ffn-ngfw-v2 --loop asyncio --timeout-keep-alive 30
+Restart=on-failure
+RestartSec=3
+[Install]
+WantedBy=multi-user.target

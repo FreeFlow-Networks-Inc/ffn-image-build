@@ -1,0 +1,23 @@
+[Unit]
+Description=FFN NGFW satellite daemon (LSVPN-style spoke enrollment + IPsec)
+Documentation=file:/opt/ffn-ngfw-v2/ffn_satd.py
+After=network-online.target ffn-sysd.service strongswan-starter.service strongswan.service
+Wants=network-online.target ffn-sysd.service
+# Satellite is inert unless /etc/ffn-ngfw/satellite.json sets enable=true.
+
+[Service]
+Type=simple
+ExecStartPre=/bin/mkdir -p /var/lib/ffn-ngfw /etc/swanctl/conf.d
+ExecStart=/usr/bin/python3 /opt/ffn-ngfw-v2/ffn_satd.py --serve
+Restart=always
+RestartSec=10
+Environment=FFN_SAT_CONFIG=/etc/ffn-ngfw/satellite.json
+Environment=FFN_SAT_STATE=/var/lib/ffn-ngfw/satellite-state.json
+Environment=FFN_SAT_TLS=/etc/ffn-ngfw/tls
+Environment=FFN_SAT_SWAN=/etc/swanctl/conf.d
+Environment=FFN_SYSD_SOCK=/run/ffn-ngfw/sysd.sock
+NoNewPrivileges=yes
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target

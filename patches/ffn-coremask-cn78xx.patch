@@ -1,0 +1,37 @@
+--- arch/mips/cavium-octeon/setup.c.ffn-bak-coremask	2026-08-28 04:12:58.711577413 +0000
++++ arch/mips/cavium-octeon/setup.c	2026-08-28 04:12:58.711857358 +0000
+@@ -704,8 +704,16 @@
+ 		 * The 32-bit core_mask IS filled on this path (the bootloader
+ 		 * prints it as 0xf here), so prefer it when ext looks wrong.
+ 		 */
+-		if (!OCTEON_IS_MODEL(OCTEON_CN78XX) &&
+-		    cvmx_coremask_get_last_core(&sysinfo->core_mask) >=
++		/*
++		 * FFN: this applies to CN78XX too. The DP (CN7885) is a
++		 * single-node part booted over PCIe, where ext_core_mask is
++		 * never initialised; excluding CN78XX here left the kernel
++		 * believing node 1 had CPUs, which panics a NUMA=n build in
++		 * octeon_memory_init() and NULL-derefs octeon_ciu3_mbox_send()
++		 * in a NUMA=y build. A genuine multi-node CCPI system is not
++		 * booted this way.
++		 */
++		if (cvmx_coremask_get_last_core(&sysinfo->core_mask) >=
+ 		    CVMX_COREMASK_MAX_CORES_PER_NODE) {
+ 			pr_info("FFN: ext_core_mask not credible, using core_mask 0x%x\n",
+ 				octeon_bootinfo->core_mask);
+@@ -718,10 +726,11 @@
+ 				    octeon_bootinfo->core_mask);
+ 	}
+ 
+-	/* Some broken u-boot pass garbage in upper bits, clear them out */
+-	if (!OCTEON_IS_MODEL(OCTEON_CN78XX))
+-		for (i = 512; i < 1024; i++)
+-			cvmx_coremask_clear_core(&sysinfo->core_mask, i);
++	/* Some broken u-boot pass garbage in upper bits, clear them out.
++	 * FFN: also done for CN78XX, for the reason given above.
++	 */
++	for (i = 512; i < 1024; i++)
++		cvmx_coremask_clear_core(&sysinfo->core_mask, i);
+ 
+ 	sysinfo->exception_base_addr = octeon_bootinfo->exception_base_addr;
+ 	sysinfo->cpu_clock_hz = octeon_bootinfo->eclock_hz;

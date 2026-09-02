@@ -1,0 +1,31 @@
+[Unit]
+Description=FFN NGFW hardware watchdog (pets /dev/watchdog so the chassis does not reset us)
+Documentation=file:/opt/ffn-ngfw-v2/ffn_watchdogd.py
+# Appliance chassis (PA-3200/PA-5200) arm a hardware watchdog that force-reboots
+# the box unless the OS services it. Start early so a slow boot is not bitten.
+DefaultDependencies=no
+After=systemd-modules-load.service local-fs.target ffn-sysd.service
+Wants=ffn-sysd.service
+Before=ffn-manager-v2.service ffn-configd.service ffn-controld.service
+Conflicts=shutdown.target
+# MUTUALLY EXCLUSIVE with systemd's RuntimeWatchdogSec -- only one process may
+# hold /dev/watchdog. Do not enable both.
+ConditionPathExistsGlob=/dev/watchdog*
+
+[Service]
+Type=simple
+ExecStartPre=/bin/mkdir -p /var/lib/ffn-ngfw
+ExecStart=/usr/bin/python3 /opt/ffn-ngfw-v2/ffn_watchdogd.py --serve
+Restart=always
+RestartSec=2
+# A watchdog daemon that dies must not take the box down with it: SIGTERM makes
+# it disarm via magic-close, so a deliberate restart never triggers a bite.
+KillSignal=SIGTERM
+TimeoutStopSec=20
+Environment=FFN_WD_CONFIG=/etc/ffn-ngfw/watchdog.json
+Environment=FFN_WD_STATE=/var/lib/ffn-ngfw/watchdog-state.json
+NoNewPrivileges=yes
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target

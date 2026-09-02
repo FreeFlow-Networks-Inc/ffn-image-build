@@ -1,0 +1,412 @@
+#!/usr/bin/env bash
+# FFN NGFW bare-metal installer -- interactive.
+#
+#   sudo ./install-to-disk.sh                    # ask everything
+#   sudo ./install-to-disk.sh /dev/sdX           # OS disk given, still asks about logs
+#   sudo ./install-to-disk.sh /dev/sdX /dev/sdY  # OS mirror given, still asks about logs
+#   FFN_ASSUME_YES=1 ... /dev/sdX                # non-interactive, no log volume
+#
+# Asks three things:
+#   1. which disk(s) hold the OS       (single, or two for a RAID1 mirror)
+#   2. which disk(s) hold /opt/ffn-logs (none, one, or two-plus)
+#   3. RAID 1 or RAID 0 for the log volume
+#
+# Expects <ver>-rootfs.tar.zst + <ver>-recovery.tar.zst alongside this script.
+# WIPES every disk selected. The OS disk gets two partitions: main root plus
+# recovery/maintenance. First boot self-provisions; FIPS-CC is toggled only from
+# the recovery partition.
+#
+# WHY RAID 0 IS OFFERED FOR LOGS BUT NOT FOR THE OS
+#
+# Logs are bulk, rewritable, and reproducible, so trading redundancy for space
+# and write throughput is a legitimate choice -- that is what RAID 0 buys, and
+# the appliance's two 1.8T spindles are there for exactly this.
+#
+# The OS volume is different, and not merely by preference:
+#   * A stripe has NO redundancy, so it doubles the probability of losing the
+#     box for a volume whose entire job is to survive a disk dying.
+#   * The mirror layout below deliberately uses --metadata=1.0, which puts the
+#     superblock at the END of the member so the ext4 filesystem still begins at
+#     offset 0. That is what lets GRUB, blkid and e2fsck read a mirror member as
+#     an ordinary partition with no RAID support present. A stripe has no such
+#     property -- no single member contains a readable filesystem -- so early
+#     boot would depend on GRUB assembling the array correctly before it can
+#     read /boot.
+# So the OS gets single-disk or RAID 1. If you genuinely want a striped OS, that
+# is a different bootloader design, not a flag.
+#
+# Much of the partitioning and mirror logic here comes from
+# install-to-disk.sh.raid1-proposed, including the metadata=1.0 reasoning, the
+# size-from-the-smaller-disk rule for mismatched reclaimed SSDs, and the
+# deliberately selective array teardown. Those were right; this adds the
+# interactive selection and the log volume.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+ROOTFS_TAR=$(ls "$HERE"/*-rootfs.tar.zst 2>/dev/null | head -1) || true
+RECOVERY_TAR=$(ls "$HERE"/*-recovery.tar.zst 2>/dev/null | head -1) || true
+die(){ echo "ERROR: $*" >&2; exit 1; }
+
+# Standalone installer: it does NOT source config.sh, so give the console baud
+# its own default. Appliance chassis (PA-3200/PA-5200) run 9600:
+#     FFN_SERIAL_BAUD=9600 sudo -E ./install-to-disk.sh
+FFN_SERIAL_BAUD="${FFN_SERIAL_BAUD:-115200}"
+FFN_ASSUME_YES="${FFN_ASSUME_YES:-0}"
+
+LOG_MD=/dev/md9          # matches the existing appliance convention
+LOG_MNT=/opt/ffn-logs
+LOG_LABEL=ffn-logs
+
+[ "$(id -u)" = 0 ] || die "run as root"
+[ -f "$ROOTFS_TAR" ]   || die "rootfs tarball not found next to this script"
+[ -f "$RECOVERY_TAR" ] || die "recovery tarball not found next to this script"
+command -v zstd >/dev/null        || die "install zstd first (apt install zstd)"
+command -v grub-install >/dev/null || die "install grub-pc-bin first"
+
+# ---------------------------------------------------------------- helpers ----
+pname(){ local p="${1}${2}"; [ -b "$p" ] || p="${1}p${2}"; echo "$p"; }
+
+# The disk the live environment itself is running from must never be offered.
+# Wiping it mid-install is unrecoverable, and it is an easy mistake to make when
+# the USB enumerates as /dev/sda.
+live_disk(){
+	local src
+	src=$(findmnt -no SOURCE / 2>/dev/null || true)
+	[ -n "$src" ] || return 0
+	lsblk -no PKNAME "$src" 2>/dev/null | head -1
+}
+
+candidates(){
+	local live; live=$(live_disk)
+	lsblk -dno NAME,SIZE,MODEL --sort NAME 2>/dev/null | while read -r n s m; do
+		case "$n" in loop*|sr*|ram*|zram*|md*|dm-*) continue;; esac
+		[ -n "$live" ] && [ "$n" = "$live" ] && continue
+		printf '%s\t%s\t%s\n' "$n" "$s" "${m:-unknown}"
+	done
+}
+
+show_candidates(){
+	local i=1
+	printf '   %-3s %-12s %-9s %s\n' "#" "DEVICE" "SIZE" "MODEL"
+	candidates | while read -r n s m; do
+		printf '   %-3s /dev/%-7s %-9s %s\n' "$i" "$n" "$s" "$m"
+		i=$((i+1))
+	done
+}
+
+nth_disk(){ candidates | sed -n "${1}p" | cut -f1; }
+ndisks(){ candidates | wc -l; }
+
+# Resolve a user answer like "1" or "1 3" or "/dev/sdb" into device paths.
+resolve(){
+	local out=() tok
+	for tok in $1; do
+		if [ -b "$tok" ]; then out+=("$tok")
+		elif [ -b "/dev/$tok" ]; then out+=("/dev/$tok")
+		else
+			local n; n=$(nth_disk "$tok" 2>/dev/null || true)
+			[ -n "$n" ] || die "not a disk or menu number: $tok"
+			out+=("/dev/$n")
+		fi
+	done
+	printf '%s\n' "${out[@]}"
+}
+
+# ---------------------------------------------------- 1. the OS disk(s) ------
+OS_DISKS=()
+if [ $# -ge 1 ]; then
+	while [ $# -gt 0 ]; do OS_DISKS+=("$1"); shift; done
+else
+	[ "$(ndisks)" -gt 0 ] || die "no candidate disks found"
+	echo
+	echo "=== 1. Where should the OS go? ==="
+	echo "Two partitions are created: main root (9 GiB) and recovery/maintenance."
+	echo "Give ONE disk for a single-disk install, or TWO for a RAID 1 mirror."
+	echo "(RAID 0 is not offered for the OS -- see the comment at the top of this script.)"
+	echo
+	show_candidates
+	echo
+	read -rp "OS disk(s) [e.g. 1  or  1 2]: " ans
+	[ -n "$ans" ] || die "no OS disk selected"
+	mapfile -t OS_DISKS < <(resolve "$ans")
+fi
+[ "${#OS_DISKS[@]}" -ge 1 ] && [ "${#OS_DISKS[@]}" -le 2 ] \
+	|| die "OS takes one disk, or two for a mirror (got ${#OS_DISKS[@]})"
+for d in "${OS_DISKS[@]}"; do [ -b "$d" ] || die "not a block device: $d"; done
+OS_RAID=0; [ "${#OS_DISKS[@]}" = 2 ] && OS_RAID=1
+[ "$OS_RAID" = 1 ] && { command -v mdadm >/dev/null || die "install mdadm first (apt install mdadm)"; }
+
+# ------------------------------------------------- 2/3. the log volume -------
+LOG_DISKS=(); LOG_LEVEL=""
+if [ "$FFN_ASSUME_YES" = 1 ]; then
+	echo "-- FFN_ASSUME_YES: skipping the log volume --"
+else
+	echo
+	echo "=== 2. Where should the log files go? ($LOG_MNT) ==="
+	echo "Leave EMPTY to keep logs on the OS disk. Otherwise pick the disk(s) to"
+	echo "dedicate to $LOG_MNT -- typically the large spindles, not the OS SSD."
+	echo
+	# Numbering MUST match the OS menu above: resolve() maps a menu number
+	# against the FULL candidate list, so renumbering a filtered list here would
+	# make "1" mean a different disk in each prompt. Show every candidate with
+	# the same number and mark the ones already claimed, rather than removing
+	# them and shifting everything up.
+	printf '   %-3s %-12s %-9s %s\n' "#" "DEVICE" "SIZE" "MODEL"
+	i=1; avail=0
+	while read -r n s m; do
+		[ -n "$n" ] || continue
+		taken=""
+		for o in "${OS_DISKS[@]}"; do
+			[ "/dev/$n" = "$o" ] && taken="   <- OS"
+		done
+		[ -z "$taken" ] && avail=$((avail+1))
+		printf '   %-3s /dev/%-7s %-9s %s%s\n' "$i" "$n" "$s" "$m" "$taken"
+		i=$((i+1))
+	done < <(candidates)
+	[ "$avail" -gt 0 ] || echo "   (no disks left after the OS selection)"
+	echo
+	read -rp "Log disk(s) [e.g. 3 4], or EMPTY for none: " lans
+	if [ -n "${lans// /}" ]; then
+		# resolve against the FULL candidate list so menu numbers stay stable
+		mapfile -t LOG_DISKS < <(resolve "$lans")
+		for d in "${LOG_DISKS[@]}"; do
+			[ -b "$d" ] || die "not a block device: $d"
+			for o in "${OS_DISKS[@]}"; do
+				[ "$d" = "$o" ] && die "$d is already the OS disk -- pick different disks for logs"
+			done
+		done
+		if [ "${#LOG_DISKS[@]}" -ge 2 ]; then
+			command -v mdadm >/dev/null || die "install mdadm first (apt install mdadm)"
+			echo
+			echo "=== 3. RAID level for $LOG_MNT across ${#LOG_DISKS[@]} disks ==="
+			echo "  1) RAID 1  mirror  -- survives a disk failure, usable capacity = smallest disk"
+			echo "  0) RAID 0  stripe  -- capacity and write throughput of all disks, NO redundancy"
+			echo "                        (one disk dies and the whole log volume is gone)"
+			echo
+			read -rp "RAID level for logs [1/0]: " rl
+			case "$rl" in
+				1) LOG_LEVEL=1 ;;
+				0) LOG_LEVEL=0 ;;
+				*) die "answer 1 or 0" ;;
+			esac
+		fi
+	fi
+fi
+
+# ------------------------------------------------------------- confirm -------
+echo
+echo "================ PLAN ================"
+if [ "$OS_RAID" = 1 ]; then
+	echo " OS   : RAID 1 mirror across ${OS_DISKS[*]}  (md0=root, md1=recovery)"
+else
+	echo " OS   : single disk ${OS_DISKS[*]}  (2 partitions: root + recovery)"
+fi
+if [ "${#LOG_DISKS[@]}" = 0 ]; then
+	echo " LOGS : on the OS disk (no dedicated volume)"
+elif [ "${#LOG_DISKS[@]}" = 1 ]; then
+	echo " LOGS : single disk ${LOG_DISKS[*]} -> $LOG_MNT"
+else
+	echo " LOGS : RAID $LOG_LEVEL across ${LOG_DISKS[*]} -> $LOG_MD -> $LOG_MNT"
+fi
+echo " Serial console baud: $FFN_SERIAL_BAUD"
+echo "======================================"
+echo
+echo "!!! This ERASES: ${OS_DISKS[*]} ${LOG_DISKS[*]:-}"
+lsblk "${OS_DISKS[@]}" ${LOG_DISKS[@]:+"${LOG_DISKS[@]}"}
+if [ "$FFN_ASSUME_YES" != 1 ]; then
+	read -rp "Type ERASE to continue: " a; [ "$a" = "ERASE" ] || die "aborted"
+fi
+
+# Stop only arrays with a member on a disk we are about to touch. "mdadm --stop
+# --scan" would stop EVERY array on the system, which on a box with an existing
+# log mirror assembled would tear that down too -- not something an installer
+# aimed at specific disks has any business doing.
+stop_arrays_on(){
+	local d base md
+	for d in "$@"; do
+		base=$(basename "$d")
+		for md in /sys/block/md*; do
+			[ -d "$md" ] || continue
+			if ls "$md"/slaves 2>/dev/null | grep -q "^${base}[0-9p]*$"; then
+				echo "-- stopping /dev/$(basename "$md") (member on $d) --"
+				mdadm --stop "/dev/$(basename "$md")" >/dev/null 2>&1 || true
+			fi
+		done
+	done
+}
+
+part_os(){   # $1 = disk, $2 = end of partition 1, $3 = end of partition 2
+	wipefs -a "$1"
+	parted -s "$1" mklabel msdos
+	parted -s "$1" mkpart primary ext4 1MiB "$2"
+	parted -s "$1" mkpart primary ext4 "$2" "$3"
+	parted -s "$1" set 1 boot on
+	if [ "$OS_RAID" = 1 ]; then
+		parted -s "$1" set 1 raid on
+		parted -s "$1" set 2 raid on
+	fi
+	partprobe "$1"; sleep 2
+}
+
+# --------------------------------------------------------- OS partitions -----
+stop_arrays_on "${OS_DISKS[@]}"
+if [ "$OS_RAID" = 1 ]; then
+	for d in "${OS_DISKS[@]}"; do
+		for n in 1 2; do mdadm --zero-superblock "$(pname "$d" "$n")" >/dev/null 2>&1 || true; done
+	done
+	# Identical explicit sizes derived from the SMALLER disk. The two SSDs in a
+	# reclaimed chassis are usually different models and differ by a few MB;
+	# "100%" would build mismatched members, mdadm would size the array to the
+	# smaller one anyway, and a later swap for a slightly smaller disk would
+	# fail. 64MiB of slack at the end leaves room for exactly that swap.
+	SMALL=""
+	for d in "${OS_DISKS[@]}"; do
+		s=$(blockdev --getsize64 "$d")
+		[ -z "$SMALL" ] && SMALL=$s
+		[ "$s" -lt "$SMALL" ] && SMALL=$s
+	done
+	USABLE_MIB=$(( SMALL / 1048576 - 64 ))
+	[ "$USABLE_MIB" -gt 12288 ] || die "OS disks too small: ${USABLE_MIB}MiB usable"
+	echo "-- partitioning ${OS_DISKS[*]} (MBR, RAID members; ${USABLE_MIB}MiB usable) --"
+	for d in "${OS_DISKS[@]}"; do part_os "$d" "9216MiB" "${USABLE_MIB}MiB"; done
+	echo "-- creating OS mirrors (metadata 1.0) --"
+	mdadm --create --run --verbose /dev/md0 --level=1 --raid-devices=2 \
+	      --metadata=1.0 --homehost=ffn --name=ffn-root \
+	      "$(pname "${OS_DISKS[0]}" 1)" "$(pname "${OS_DISKS[1]}" 1)"
+	mdadm --create --run --verbose /dev/md1 --level=1 --raid-devices=2 \
+	      --metadata=1.0 --homehost=ffn --name=ffn-recovery \
+	      "$(pname "${OS_DISKS[0]}" 2)" "$(pname "${OS_DISKS[1]}" 2)"
+	P1=/dev/md0; P2=/dev/md1
+else
+	echo "-- partitioning ${OS_DISKS[0]} (MBR: main root + recovery) --"
+	part_os "${OS_DISKS[0]}" 9GiB 100%
+	P1=$(pname "${OS_DISKS[0]}" 1)
+	P2=$(pname "${OS_DISKS[0]}" 2)
+fi
+
+mkfs.ext4 -q -F -L ffn-root     "$P1"
+mkfs.ext4 -q -F -L ffn-recovery "$P2"
+
+# ---------------------------------------------------------- log volume -------
+LOG_DEV=""
+if [ "${#LOG_DISKS[@]}" -ge 1 ]; then
+	stop_arrays_on "${LOG_DISKS[@]}"
+	for d in "${LOG_DISKS[@]}"; do
+		wipefs -a "$d" >/dev/null 2>&1 || true
+		mdadm --zero-superblock "$d" >/dev/null 2>&1 || true
+		parted -s "$d" mklabel gpt
+		# One whole-disk partition. GPT because these are typically multi-TB
+		# spindles, where MBR cannot address the full device.
+		parted -s "$d" mkpart primary ext4 1MiB 100%
+		[ "${#LOG_DISKS[@]}" -ge 2 ] && parted -s "$d" set 1 raid on
+		partprobe "$d"; sleep 2
+		mdadm --zero-superblock "$(pname "$d" 1)" >/dev/null 2>&1 || true
+	done
+	if [ "${#LOG_DISKS[@]}" = 1 ]; then
+		LOG_DEV=$(pname "${LOG_DISKS[0]}" 1)
+		echo "-- log volume: single disk $LOG_DEV --"
+	else
+		members=(); for d in "${LOG_DISKS[@]}"; do members+=("$(pname "$d" 1)"); done
+		echo "-- creating log array $LOG_MD (RAID $LOG_LEVEL across ${#members[@]} members) --"
+		# metadata 1.2 is fine here, unlike the OS mirror: nothing needs to read
+		# a member as a bare filesystem before the array is assembled, because
+		# the log volume is mounted by fstab long after the initramfs is done.
+		mdadm --create --run --verbose "$LOG_MD" --level="$LOG_LEVEL" \
+		      --raid-devices="${#members[@]}" --metadata=1.2 \
+		      --homehost=ffn --name="$LOG_LABEL" "${members[@]}"
+		LOG_DEV="$LOG_MD"
+	fi
+	mkfs.ext4 -q -F -L "$LOG_LABEL" "$LOG_DEV"
+fi
+
+# ------------------------------------------------------------- extract -------
+MNT=$(mktemp -d); MNT2=$(mktemp -d)
+echo "-- extracting main root --"; mount "$P1" "$MNT";  zstd -dc "$ROOTFS_TAR"   | tar --numeric-owner --xattrs -C "$MNT"  -xf -
+echo "-- extracting recovery --";  mount "$P2" "$MNT2"; zstd -dc "$RECOVERY_TAR" | tar --numeric-owner --xattrs -C "$MNT2" -xf -
+
+# fstab: mount the log volume by LABEL, which survives the array being renumbered
+# (md9 -> md127 is the classic surprise when a foreign homehost is seen).
+if [ -n "$LOG_DEV" ]; then
+	mkdir -p "$MNT$LOG_MNT"
+	grep -q "$LOG_MNT" "$MNT/etc/fstab" 2>/dev/null \
+		|| echo "LABEL=$LOG_LABEL  $LOG_MNT  ext4  defaults,noatime,nofail  0  2" >> "$MNT/etc/fstab"
+	echo "-- fstab: LABEL=$LOG_LABEL -> $LOG_MNT (nofail, so a missing log volume never blocks boot) --"
+fi
+
+echo "-- installing GRUB (main + recovery entries) --"
+KVER=$(ls "$MNT/boot"/vmlinuz-* | sed 's#.*/vmlinuz-##' | sort | tail -1)
+# Locate recovery by LABEL rather than a hardcoded (hd0,msdos2): under RAID the
+# recovery mirror is not on hd0 in any fixed sense, and search also survives a
+# disk being pulled or the BIOS renumbering drives.
+cat > "$MNT/etc/grub.d/40_custom" <<EOF
+#!/bin/sh
+exec tail -n +3 \$0
+menuentry 'FFN NGFW Recovery / Maintenance' --class ffn {
+  search --no-floppy --label --set=root ffn-recovery
+  linux /boot/vmlinuz-$KVER root=LABEL=ffn-recovery ro console=tty0 console=ttyS0,${FFN_SERIAL_BAUD}n8
+  initrd /boot/initrd.img-$KVER
+}
+EOF
+chmod +x "$MNT/etc/grub.d/40_custom"
+grep -q GRUB_DISABLE_OS_PROBER "$MNT/etc/default/grub" || echo "GRUB_DISABLE_OS_PROBER=true" >> "$MNT/etc/default/grub"
+
+# GRUB repaints the whole menu on every countdown tick. At 9600 baud that is
+# ~2 seconds per tick, which is what makes an appliance console crawl. countdown
+# prints one line per second instead, and the menu is still one keypress away so
+# the recovery entry stays reachable. 'quiet' is deliberately NOT added -- this
+# box has no video, so boot progress on serial is the only progress there is,
+# and verify-image.sh checks for exactly that.
+grep -q '^GRUB_TIMEOUT_STYLE=' "$MNT/etc/default/grub" \
+	|| echo 'GRUB_TIMEOUT_STYLE=countdown' >> "$MNT/etc/default/grub"
+
+mount -t proc proc "$MNT/proc"; mount -t sysfs sys "$MNT/sys"; mount --rbind /dev "$MNT/dev"
+
+# Any array that has to be assembled before or during boot must be described
+# inside the image. For the OS mirror the initramfs needs it to mount root at
+# all; the log array does not, but recording it keeps md9 from being assembled
+# as md127 under a foreign homehost.
+# NOTE the grouping: || and && are equal precedence and left-associative in
+# bash, so without the braces this reads (OS_RAID || LOG_DEV) && LOG_DISKS>=2 --
+# which would SKIP mdadm.conf for an OS mirror with no log array, leaving an
+# initramfs that cannot assemble root. Unbootable box.
+if [ "$OS_RAID" = 1 ] || { [ -n "$LOG_DEV" ] && [ "${#LOG_DISKS[@]}" -ge 2 ]; }; then
+	mkdir -p "$MNT/etc/mdadm"
+	{ echo "HOMEHOST <ignore>"; mdadm --detail --scan; } > "$MNT/etc/mdadm/mdadm.conf"
+	echo "-- wrote /etc/mdadm/mdadm.conf --"
+fi
+if [ "$OS_RAID" = 1 ]; then
+	chroot "$MNT" sh -c 'command -v update-initramfs >/dev/null' \
+		|| die "target image has no update-initramfs; cannot build a RAID-capable initrd"
+	chroot "$MNT" update-initramfs -u -k all
+	# core.img must read a 1.x superblock member before the initrd exists, and
+	# GRUB goes on BOTH disks so the box still boots with either one pulled.
+	# That is the entire point of the mirror.
+	for d in "${OS_DISKS[@]}"; do
+		grub-install --target=i386-pc --modules="mdraid1x part_msdos ext2" \
+		             --boot-directory="$MNT/boot" "$d"
+	done
+else
+	grub-install --target=i386-pc --boot-directory="$MNT/boot" "${OS_DISKS[0]}"
+fi
+
+chroot "$MNT" grub-mkconfig -o /boot/grub/grub.cfg
+umount -R "$MNT/dev" 2>/dev/null || true; umount "$MNT/sys" "$MNT/proc" 2>/dev/null || true
+umount "$MNT" "$MNT2"; rmdir "$MNT" "$MNT2"
+
+echo
+echo "DONE. Reboot into the appliance."
+echo "  Normal boot  -> FFN NGFW (first boot self-provisions; WebUI https://<dhcp-ip>:8443)."
+echo "  Recovery     -> pick 'FFN NGFW Recovery / Maintenance' in GRUB to enable/disable FIPS-CC (wipes config)."
+if [ "$OS_RAID" = 1 ]; then
+	echo "  OS RAID1     -> /dev/md0 = ffn-root, /dev/md1 = ffn-recovery, GRUB on both disks."
+fi
+if [ "${#LOG_DISKS[@]}" -ge 2 ]; then
+	echo "  LOG RAID$LOG_LEVEL   -> $LOG_MD = $LOG_LABEL mounted at $LOG_MNT"
+	[ "$LOG_LEVEL" = 0 ] && echo "                  NOTE: RAID 0 has no redundancy -- one disk lost is all logs lost."
+elif [ "${#LOG_DISKS[@]}" = 1 ]; then
+	echo "  LOGS         -> $LOG_DEV mounted at $LOG_MNT"
+fi
+if [ "$OS_RAID" = 1 ] || [ "${#LOG_DISKS[@]}" -ge 2 ]; then
+	echo "  Sync runs in the background after boot. Check: cat /proc/mdstat"
+	cat /proc/mdstat
+fi

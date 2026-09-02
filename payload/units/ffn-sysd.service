@@ -1,0 +1,26 @@
+[Unit]
+Description=FFN NGFW system state bus + name service (sysd)
+Documentation=file:/opt/ffn-ngfw-v2/ffn_sysd.py
+# The state bus must exist before anything that publishes to it.
+After=network-pre.target
+Before=ffn-configd.service ffn-controld.service ffn-manager-v2.service ffn-satd.service
+Wants=ffn-hwdetect.service
+After=ffn-hwdetect.service
+
+[Service]
+Type=simple
+ExecStartPre=/bin/mkdir -p /run/ffn-ngfw /var/lib/ffn-ngfw
+ExecStart=/usr/bin/python3 /opt/ffn-ngfw-v2/ffn_sysd.py --serve
+Restart=always
+RestartSec=2
+# stdlib-only daemon: no venv, starts early
+Environment=FFN_SYSD_SOCK=/run/ffn-ngfw/sysd.sock
+Environment=FFN_SYSD_STATE=/var/lib/ffn-ngfw/sysd-state.json
+Environment=FFN_SYSD_VARS=/etc/ffn-ngfw/sysd-vars.json
+# hardening (state bus needs no privileges beyond its own dirs)
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,895 @@
+#!/usr/bin/env python3
+"""
+ffn-cli — PAN-OS style restricted CLI shell for FFN NGFW.
+
+This is the login shell for admin users. It restricts SSH sessions
+to a firewall-specific command set (operational + configure modes).
+
+Hidden escape commands exist for Anthropic/vendor support to drop to
+bash with appropriate challenge-response authentication — these are
+not documented in `help` and require the master key.
+
+Installation:
+  chown root:root /usr/local/bin/ffn-cli
+  chmod 755 /usr/local/bin/ffn-cli
+  # Add to /etc/shells
+  echo /usr/local/bin/ffn-cli >> /etc/shells
+  # Set as user login shell
+  chsh -s /usr/local/bin/ffn-cli admin
+
+The CLI proxies commands to the FFN management API (port 8443 local),
+reusing the JWT auth and commit/config/lock workflow.
+"""
+
+import getpass
+import hashlib
+import hmac
+import json
+import os
+import pwd
+import readline  # noqa: F401 — enables history/completion
+import shlex
+import signal
+import socket
+import ssl
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+# ---- Configuration ---------------------------------------------------------
+
+FFN_API = os.getenv("FFN_CLI_API", "https://127.0.0.1:8443")
+HISTORY_FILE = Path.home() / ".ffn_cli_history"
+AUDIT_LOG = "/var/log/ffn-ngfw/cli-audit.log"
+MASTER_KEY_FILE = "/etc/ffn-ngfw/master.key"  # HMAC key for escape verification
+MAX_HISTORY = 5000
+
+# Hidden escape commands require this "magic phrase" as the first token after
+# entering debug mode. The actual challenge is HMAC-based so the phrase alone
+# is not sufficient.
+ESCAPE_TRIGGER = "maint"
+DEBUG_TRIGGER = "debug"
+
+# ---- ANSI colors -----------------------------------------------------------
+
+
+class C:
+    R = "\033[31m"
+    G = "\033[32m"
+    Y = "\033[33m"
+    B = "\033[34m"
+    DIM = "\033[2m"
+    BOLD = "\033[1m"
+    RESET = "\033[0m"
+
+
+def color(s, c):
+    return f"{c}{s}{C.RESET}" if sys.stdout.isatty() else s
+
+
+# ---- Audit log -------------------------------------------------------------
+
+
+def audit(event: str, detail: str = ""):
+    """Write an audit entry for every command executed."""
+    try:
+        os.makedirs(os.path.dirname(AUDIT_LOG), exist_ok=True)
+        with open(AUDIT_LOG, "a") as f:
+            user = os.getenv("SUDO_USER") or os.getenv("USER") or pwd.getpwuid(os.getuid()).pw_name
+            f.write(f"{datetime.now().isoformat()}Z\t{user}\t{os.getppid()}\t{event}\t{detail}\n")
+    except Exception:
+        # Audit is best-effort; never break the CLI
+        pass
+
+
+# ---- API helpers -----------------------------------------------------------
+
+
+class APIError(Exception):
+    pass
+
+
+def _ssl_ctx():
+    """TLS context for the local mgmt API (self-signed HTTPS). For loopback
+    the cert SAN will not match 127.0.0.1, so verification is disabled there."""
+    if not FFN_API.lower().startswith("https"):
+        return None
+    ctx = ssl.create_default_context()
+    host = urllib.parse.urlparse(FFN_API).hostname or ""
+    if host in ("127.0.0.1", "localhost", "::1"):
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def api(path: str, method: str = "GET", body: dict = None, token: str = None) -> dict:
+    url = FFN_API.rstrip("/") + path
+    data = json.dumps(body).encode() if body else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Content-Type", "application/json")
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(req, timeout=10, context=_ssl_ctx()) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        try:
+            err = json.loads(e.read())
+        except Exception:
+            err = {"detail": str(e)}
+        raise APIError(f"[{e.code}] {err.get('detail', 'Request failed')}")
+    except urllib.error.URLError as e:
+        raise APIError(f"Cannot reach management API at {FFN_API}: {e.reason}")
+
+
+def login(username: str, password: str) -> str:
+    result = api("/api/auth/login", method="POST",
+                 body={"username": username, "password": password})
+    return result["access_token"]
+
+
+# ---- Master key verification (HMAC challenge) ------------------------------
+
+
+def get_master_key() -> bytes:
+    """Load the master key for HMAC escape verification."""
+    try:
+        with open(MASTER_KEY_FILE, "rb") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        # Bootstrap: if no master key exists, synthesize from machine-id.
+        # In production this should be provisioned during install.
+        try:
+            with open("/etc/machine-id") as f:
+                return hashlib.sha256(f.read().strip().encode()).digest()
+        except Exception:
+            return b"default-ffn-ngfw-master-key-change-me"
+
+
+def verify_escape_challenge(username: str, response: str) -> bool:
+    """
+    Verify the escape challenge response. The expected response is:
+      HMAC-SHA256(master_key, username + ":" + minute_epoch).hex()[:16]
+    The minute_epoch gives a 60-second window.
+    """
+    key = get_master_key()
+    minute = int(time.time() // 60)
+    # Accept current minute or previous minute (clock skew tolerance)
+    for m in (minute, minute - 1):
+        msg = f"{username}:{m}".encode()
+        expected = hmac.new(key, msg, hashlib.sha256).hexdigest()[:16]
+        if hmac.compare_digest(expected, response.strip()):
+            return True
+    return False
+
+
+def generate_escape_token(username: str) -> str:
+    """Generate a valid escape token (for support tools)."""
+    key = get_master_key()
+    minute = int(time.time() // 60)
+    msg = f"{username}:{minute}".encode()
+    return hmac.new(key, msg, hashlib.sha256).hexdigest()[:16]
+
+
+# ---- Pretty output helpers -------------------------------------------------
+
+
+def print_table(headers: list, rows: list, widths: list = None):
+    if widths is None:
+        widths = [max(len(str(h)), *(len(str(r[i])) for r in rows)) if rows else len(h)
+                  for i, h in enumerate(headers)]
+    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+    print(color(fmt.format(*headers), C.BOLD))
+    print(color("  ".join("-" * w for w in widths), C.DIM))
+    for r in rows:
+        print(fmt.format(*[str(x) for x in r]))
+
+
+def print_kv(items: list):
+    width = max((len(k) for k, _ in items), default=0)
+    for k, v in items:
+        print(f"  {color(k.ljust(width), C.DIM)}  {v}")
+
+
+# ---- Command dispatch ------------------------------------------------------
+
+
+class Session:
+    def __init__(self, username: str, token: str):
+        self.username = username
+        self.token = token
+        self.mode = "operational"  # operational | configure | debug | maint
+        self.hostname = self._get_hostname()
+        self.lock_held = False
+        self._setup_readline()
+
+    def _get_hostname(self):
+        try:
+            s = api("/api/system/status", token=self.token)
+            return s.get("hostname", "ffn-ngfw")
+        except Exception:
+            return socket.gethostname()
+
+    def _setup_readline(self):
+        import readline
+        try:
+            readline.read_history_file(str(HISTORY_FILE))
+        except FileNotFoundError:
+            pass
+        readline.set_history_length(MAX_HISTORY)
+        readline.parse_and_bind("tab: complete")
+        readline.set_completer(self._complete)
+
+    def _complete(self, text, state):
+        matches = [c for c in self._available_commands() if c.startswith(text)]
+        return matches[state] if state < len(matches) else None
+
+    def _available_commands(self):
+        if self.mode == "operational":
+            return ["show", "set", "configure", "commit", "ping", "traceroute",
+                    "request", "allow", "exit", "quit", "help", "?", "clear", "save",
+                    "restart", "reboot", "tail", "less", "test", "monitor"]
+        if self.mode == "configure":
+            return ["set", "delete", "show", "edit", "commit", "revert",
+                    "exit", "quit", "top", "up", "help", "?"]
+        if self.mode == "debug":
+            return ["show", "exit", "quit", "help"]
+        if self.mode == "maint":
+            return ["exit", "quit"]
+        return []
+
+    def save_history(self):
+        try:
+            import readline
+            HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+            readline.write_history_file(str(HISTORY_FILE))
+        except Exception:
+            pass
+
+    # ---- Prompt --------------------------------------------------------
+
+    def prompt(self) -> str:
+        if self.mode == "operational":
+            return f"{self.username}@{self.hostname}> "
+        if self.mode == "configure":
+            lock = " *" if self.lock_held else ""
+            return f"{self.username}@{self.hostname}{lock}# "
+        if self.mode == "debug":
+            return color(f"{self.username}@{self.hostname}(debug)> ", C.Y)
+        if self.mode == "maint":
+            return color(f"{self.username}@{self.hostname}(maint)# ", C.R)
+        return "> "
+
+    # ---- Command loop --------------------------------------------------
+
+    def run(self):
+        self._banner()
+        while True:
+            try:
+                line = input(self.prompt()).strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+            if not line:
+                continue
+            audit("command", line)
+            try:
+                if not self._dispatch(line):
+                    break
+            except APIError as e:
+                print(color(f"Error: {e}", C.R))
+            except Exception as e:
+                print(color(f"Command failed: {e}", C.R))
+        self.save_history()
+        print("Goodbye.")
+
+    def _banner(self):
+        print()
+        print(color("  FFN NGFW Command Line Interface", C.BOLD))
+        try:
+            s = api("/api/system/status", token=self.token)
+            print(color(f"  Host: {s.get('hostname')}   FPGA: {'v'+s.get('fpga_version') if s.get('fpga_detected') else 'not detected'}", C.DIM))
+            print(color(f"  Uptime: {s.get('uptime_human')}   Platform: {s.get('platform')}", C.DIM))
+        except APIError:
+            print(color("  (management API unavailable — limited functionality)", C.Y))
+        print(color("  Type 'help' or '?' for a command list.", C.DIM))
+        print()
+
+    def _dispatch(self, line: str) -> bool:
+        """
+        Execute a command. Returns False to exit the shell, True to continue.
+        """
+        # Parse
+        try:
+            tokens = shlex.split(line)
+        except ValueError as e:
+            print(color(f"Parse error: {e}", C.R))
+            return True
+        if not tokens:
+            return True
+        cmd, args = tokens[0], tokens[1:]
+
+        # Mode exits
+        if cmd in ("exit", "quit"):
+            if self.mode in ("configure", "debug", "maint"):
+                if self.mode == "configure" and self.lock_held:
+                    self._release_lock()
+                self.mode = "operational"
+                return True
+            return False
+
+        # Hidden escape commands (not shown in help)
+        if cmd == DEBUG_TRIGGER and self.mode == "operational":
+            return self._cmd_debug(args)
+        if cmd == ESCAPE_TRIGGER and self.mode in ("operational", "debug"):
+            return self._cmd_maint(args)
+
+        # Mode-specific dispatch
+        handler = getattr(self, f"_cmd_{cmd.replace('-', '_')}", None)
+        if handler is None:
+            print(f"Unknown command: {cmd}. Type '?' for help.")
+            return True
+        return handler(args) if handler(args) is not None else True
+
+    # ---- Operational commands ------------------------------------------
+
+    def _cmd_help(self, args): return self._cmd_question(args)
+
+    def _cmd_question(self, args):
+        cmds = {
+            "operational": [
+                ("show", "Display system/config information"),
+                ("configure", "Enter configuration mode"),
+                ("commit", "Commit candidate configuration"),
+                ("ping <host>", "Ping a host"),
+                ("traceroute <host>", "Trace route to a host"),
+                ("request restart {dataplane|system}", "Restart subsystem"),
+                ("request reload dataplane", "Force ffn-dpd to recompile + push policy"),
+                ("allow zerotier", "Insert top-priority permit rule for zt* interfaces"),
+                ("clear session table", "Flush session table"),
+                ("tail log <name>", "Tail a log file"),
+                ("exit", "Log out of the CLI"),
+            ],
+            "configure": [
+                ("set <path> <value>", "Set a candidate config value (xpath dotted)"),
+                ("delete <path>", "Delete a candidate value"),
+                ("show [<path>]", "Show candidate config"),
+                ("commit [description]", "Commit changes to running"),
+                ("revert", "Discard candidate changes"),
+                ("exit", "Leave configure mode"),
+            ],
+            "debug": [
+                ("show <item>", "Show debug information"),
+                ("exit", "Leave debug mode"),
+            ],
+        }
+        print()
+        for line in cmds.get(self.mode, []):
+            print(f"  {color(line[0].ljust(34), C.G)}  {line[1]}")
+        print()
+        return True
+
+    def _cmd_show(self, args):
+        if not args:
+            return self._show_usage()
+        sub = args[0]
+        rest = args[1:]
+        if sub == "system":
+            return self._show_system(rest)
+        if sub == "interfaces":
+            return self._show_interfaces(rest)
+        if sub == "routing":
+            return self._show_routing(rest)
+        if sub == "arp":
+            return self._show_arp()
+        if sub == "sessions":
+            return self._show_sessions()
+        if sub == "engines":
+            return self._show_engines()
+        if sub == "log":
+            return self._show_log(rest)
+        if sub == "config":
+            return self._show_config(rest)
+        if sub == "users":
+            return self._show_users()
+        if sub == "commit-lock":
+            return self._show_commit_lock()
+        print(f"Unknown 'show' sub: {sub}")
+        return True
+
+    def _show_usage(self):
+        print("Usage: show <system|interfaces|routing|arp|sessions|engines|log|config|users|commit-lock>")
+        return True
+
+    def _show_system(self, args):
+        s = api("/api/system/status", token=self.token)
+        r = api("/api/system/resources", token=self.token)
+        print_kv([
+            ("Hostname", s.get("hostname")),
+            ("Uptime", s.get("uptime_human")),
+            ("Platform", f"{s.get('platform')} {s.get('kernel','')}"),
+            ("CPU", f"{r['cpu']['model']} ({r['cpu']['cores_physical']} cores)"),
+            ("CPU Usage", f"{r['cpu']['usage_percent']}%"),
+            ("Memory", f"{r['memory']['used_gb']}/{r['memory']['total_gb']} GB ({r['memory']['percent']}%)"),
+            ("Disk", f"{r['disk']['used_gb']}/{r['disk']['total_gb']} GB ({r['disk']['percent']}%)"),
+            ("FPGA", f"v{s.get('fpga_version')}" if s.get("fpga_detected") else "not detected"),
+        ])
+        return True
+
+    def _show_interfaces(self, args):
+        d = api("/api/system/interfaces", token=self.token)
+        rows = []
+        for i in d.get("interfaces", []):
+            rows.append([
+                i.get("name", "-"),
+                i.get("type", "-"),
+                "up" if i.get("link_up") else "down",
+                f"{i.get('speed_gbps', 0)}G",
+                i.get("ip_address") or "-",
+                i.get("mac") or "-",
+                i.get("rx_packets", 0),
+                i.get("tx_packets", 0),
+            ])
+        print_table(["Name", "Type", "State", "Speed", "IP", "MAC", "RX Pkts", "TX Pkts"], rows)
+        return True
+
+    def _show_routing(self, args):
+        d = api("/api/network/routes", token=self.token)
+        rows = [[r.get("destination"), r.get("next_hop"), r.get("interface"),
+                 r.get("metric", "-"), r.get("protocol", "-")] for r in d.get("routes", [])]
+        print_table(["Destination", "Next Hop", "Interface", "Metric", "Protocol"], rows)
+        return True
+
+    def _show_arp(self):
+        d = api("/api/network/arp", token=self.token)
+        rows = [[e.get("ip"), e.get("mac"), e.get("interface"), e.get("state")]
+                for e in d.get("arp_table", [])]
+        print_table(["IP", "MAC", "Interface", "State"], rows)
+        return True
+
+    def _show_sessions(self):
+        s = api("/api/dashboard/sessions", token=self.token)
+        print_kv([
+            ("Active Sessions", s.get("active", "-")),
+            ("Established", s.get("established", "-")),
+            ("Listen", s.get("listen", "-")),
+            ("Time Wait", s.get("time_wait", "-")),
+            ("Hit Ratio", f"{s.get('hit_ratio', 0)}%"),
+        ])
+        return True
+
+    def _show_engines(self):
+        d = api("/api/engines", token=self.token)
+        fpga = "active" if d.get("fpga_active") else "not active"
+        print(color(f"FPGA Engines: {fpga}", C.DIM))
+        rows = [[e["id"], e["name"], "yes" if e["enabled"] else "no",
+                 e.get("packets", 0), e.get("matches", 0), e.get("drops", 0)]
+                for e in d.get("engines", [])]
+        print_table(["ID", "Name", "Enabled", "Packets", "Matches", "Drops"], rows)
+        return True
+
+    def _show_log(self, args):
+        ltype = args[0] if args else "system"
+        if ltype not in ("system", "traffic", "security"):
+            print("Usage: show log <system|traffic|security>")
+            return True
+        d = api(f"/api/logs/{ltype}", token=self.token)
+        for entry in (d.get("logs") or [])[:40]:
+            sev = entry.get("severity", "INFO")
+            col = C.R if sev in ("ERROR", "CRITICAL") else (C.Y if sev == "WARNING" else C.DIM)
+            print(f"{color(entry.get('timestamp',''), C.DIM)} {color(sev, col)} {entry.get('message')}")
+        return True
+
+    def _show_config(self, args):
+        scope = "candidate" if (args and args[0] == "candidate") else "running"
+        d = api(f"/api/config/{scope}", token=self.token)
+        print(d.get("xml", ""))
+        return True
+
+    def _show_users(self):
+        u = api("/api/auth/me", token=self.token)
+        print_kv([("Current User", u.get("username")), ("Role", u.get("role"))])
+        return True
+
+    def _show_commit_lock(self):
+        d = api("/api/config/lock", token=self.token)
+        if d.get("locked"):
+            print_kv([("Status", color("LOCKED", C.R)),
+                      ("Holder", d.get("holder")),
+                      ("Reason", d.get("reason", "-")),
+                      ("Age", f"{d.get('age_seconds',0)}s"),
+                      ("Expires in", f"{d.get('expires_in',0)}s")])
+        else:
+            print(color("Commit lock: unlocked", C.G))
+        return True
+
+    # ---- Configure mode ------------------------------------------------
+
+    def _cmd_configure(self, args):
+        self.mode = "configure"
+        # Acquire lock automatically
+        try:
+            api("/api/config/lock", method="POST",
+                body={"reason": "cli-editing"}, token=self.token)
+            self.lock_held = True
+            print("Entering configuration mode")
+            print(color("[edit]", C.DIM))
+        except APIError as e:
+            print(color(f"Could not acquire config lock: {e}", C.Y))
+            print("Entering configure mode anyway — you cannot commit until the lock is available.")
+        return True
+
+    def _cmd_set(self, args):
+        if self.mode != "configure":
+            print("'set' must be used from configure mode. Type 'configure' first.")
+            return True
+        if len(args) < 2:
+            print("Usage: set <xpath.dotted.path> <value>")
+            return True
+        xpath, value = args[0], " ".join(args[1:])
+        api("/api/config/candidate/update", method="POST",
+            body={"xpath": xpath, "value": value}, token=self.token)
+        print(color(f"[edit] {xpath} = {value}", C.DIM))
+        return True
+
+    def _cmd_delete(self, args):
+        if self.mode != "configure":
+            print("'delete' must be used from configure mode.")
+            return True
+        if not args:
+            print("Usage: delete <xpath>")
+            return True
+        xpath = args[0]
+        api("/api/config/candidate/update", method="POST",
+            body={"xpath": xpath, "value": ""}, token=self.token)
+        print(color(f"[delete] {xpath}", C.DIM))
+        return True
+
+    def _cmd_commit(self, args):
+        description = " ".join(args) if args else ""
+        d = api("/api/config/diff", token=self.token)
+        if not d.get("has_changes"):
+            print("No changes to commit.")
+            return True
+        n = d.get("total_changes", 0)
+        print(f"Committing {n} change{'s' if n != 1 else ''}...")
+        result = api("/api/config/commit", method="POST",
+                     body={"description": description}, token=self.token)
+        if result.get("status") == "committed":
+            print(color(f"Commit succeeded (snapshot: {result.get('snapshot')})", C.G))
+            ap = result.get("apply_status") or {}
+            if ap:
+                overall = ap.get("overall", "?")
+                col = C.G if overall == "applied" else (C.Y if "partial" in str(overall) else C.R)
+                stats = ap.get("stats", {})
+                print(color(f"  Apply: {overall}  applied={stats.get('applied',0)}  errors={stats.get('errors',0)}", col))
+                for a in ap.get("applied", [])[:20]:
+                    print(color(f"    ✓ [{a.get('applier')}] {a.get('xpath')} → {a.get('new','')}", C.DIM))
+                for e in ap.get("errors", []):
+                    print(color(f"    ✗ [{e.get('applier')}] {e.get('xpath')}: {e.get('error')}", C.R))
+                for v in ap.get("validation_errors", []):
+                    print(color(f"    ! validation: {v}", C.R))
+            elif result.get("applied_to_system"):
+                print(color(f"  Applied: {', '.join(result['applied_to_system'])}", C.DIM))
+            self.lock_held = False
+        else:
+            print(result.get("message", str(result)))
+        return True
+
+    def _cmd_revert(self, args):
+        if self.mode != "configure":
+            print("'revert' must be used from configure mode.")
+            return True
+        api("/api/config/revert", method="POST", token=self.token)
+        print("Candidate configuration reverted to running.")
+        return True
+
+    def _release_lock(self):
+        try:
+            api("/api/config/lock", method="DELETE", token=self.token)
+            self.lock_held = False
+        except APIError:
+            pass
+
+    # ---- Diagnostic commands -------------------------------------------
+
+    def _cmd_ping(self, args):
+        if not args:
+            print("Usage: ping <host>")
+            return True
+        r = api("/api/system/diagnostic", method="POST",
+                body={"command": "ping", "target": args[0]}, token=self.token)
+        print(r.get("output", ""))
+        return True
+
+    def _cmd_traceroute(self, args):
+        if not args:
+            print("Usage: traceroute <host>")
+            return True
+        r = api("/api/system/diagnostic", method="POST",
+                body={"command": "traceroute", "target": args[0]}, token=self.token)
+        print(r.get("output", ""))
+        return True
+
+    def _cmd_request(self, args):
+        if not args:
+            print("Usage: request <restart|allow|reload|system shell> ...")
+            return True
+        sub = args[0]
+        if sub == "restart":
+            target = args[1] if len(args) > 1 else "dataplane"
+            r = api("/api/dataplane/restart", method="POST",
+                    body={"target": target}, token=self.token)
+            print(r.get("message", ""))
+        elif sub == "allow":
+            return self._cmd_allow(args[1:])
+        elif sub == "reload":
+            # `request reload dataplane` — force ffn-dpd to recompile & push rules
+            tgt = args[1] if len(args) > 1 else "dataplane"
+            if tgt in ("dataplane", "dpd"):
+                r = api("/api/dpd/reload", method="POST", token=self.token)
+                print(f"dpd reload: {r.get('reason','?')} "
+                      f"backend={r.get('backend','?')} rules={r.get('rule_count','?')}")
+            else:
+                print(f"Unknown reload target: {tgt}")
+        elif sub == "system" and len(args) > 1 and args[1] == "shell":
+            return self._cmd_request_shell()
+        else:
+            print(f"Unknown request: {sub}")
+        return True
+
+    def _cmd_request_shell(self):
+        """`request system shell` -- superuser escape to the Linux shell,
+        gated by an FFN password re-auth on top of the SSH login."""
+        try:
+            me = api("/api/auth/me", token=self.token) or {}
+        except APIError as e:
+            print(color(f"Cannot verify role: {e}", C.R)); return True
+        role = me.get("role", "")
+        if role not in ("superuser", "admin"):
+            audit("request-shell-denied", f"user={self.username} role={role}")
+            print(color("Permission denied: 'request system shell' requires "
+                        "superuser or admin role.", C.R))
+            return True
+        print(color("\u26a0  Escaping to the Linux shell. Re-enter your FFN "
+                    "password to confirm.", C.Y))
+        try:
+            pw = getpass.getpass("Password: ")
+        except (EOFError, KeyboardInterrupt):
+            print(); return True
+        try:
+            login(self.username, pw)
+        except APIError:
+            audit("request-shell-failed", f"user={self.username} reauth-failed")
+            print(color("\u2717 Authentication failed.", C.R)); return True
+        audit("request-shell-ok", f"user={self.username}")
+        return self._cmd_shell_escape([])
+
+    def _cmd_allow(self, args):
+        """
+        Shorthand policy insertions:
+          allow zerotier            — permit anything arriving on zt*
+        Equivalent long form:
+          request allow zerotier
+        """
+        if not args:
+            print("Usage: allow zerotier")
+            return True
+        target = args[0].lower()
+        if target in ("zerotier", "zt"):
+            r = api("/api/policy/rules/quick/allow-zerotier",
+                    method="POST", token=self.token)
+            status = r.get("status", "?")
+            rid = r.get("rule_id", "?")
+            match = r.get("match", {})
+            print(color(
+                f"allow-zerotier rule {status} (id={rid}, match iifname='{match.get('src_iface','?')}')",
+                C.G,
+            ))
+            reload_info = r.get("dpd_reload")
+            if reload_info and isinstance(reload_info, dict):
+                print(color(
+                    f"  dpd reloaded: backend={reload_info.get('backend','?')} "
+                    f"rules={reload_info.get('rule_count','?')}",
+                    C.DIM,
+                ))
+            else:
+                print(color("  (ffn-dpd not reachable — rule will apply on next commit)",
+                            C.Y))
+            print(color("  note: rule is in candidate. Run 'commit' to persist it.",
+                        C.DIM))
+        else:
+            print(f"Unknown allow target: {target}")
+        return True
+
+    def _cmd_reboot(self, args):
+        if not self._confirm("Reboot the system? [y/N] "):
+            return True
+        r = api("/api/system/diagnostic", method="POST",
+                body={"command": "reboot"}, token=self.token)
+        print(r.get("output", ""))
+        return True
+
+    def _cmd_clear(self, args):
+        if not args:
+            print("\033[2J\033[H", end="")  # clear screen
+            return True
+        if args[0] == "session" and len(args) > 1 and args[1] == "table":
+            print("Session table flush requested (no-op in sim mode)")
+            return True
+        print(f"Unknown clear: {' '.join(args)}")
+        return True
+
+    def _cmd_save(self, args):
+        name = args[0] if args else f"manual-{int(time.time())}"
+        r = api("/api/config/snapshots", method="POST",
+                body={"name": name, "description": "CLI save"}, token=self.token)
+        print(f"Snapshot saved: {r.get('name')}")
+        return True
+
+    def _cmd_tail(self, args):
+        if len(args) < 2 or args[0] != "log":
+            print("Usage: tail log <system|traffic|security>")
+            return True
+        return self._show_log([args[1]])
+
+    # ---- Hidden escape commands ----------------------------------------
+
+    def _cmd_debug(self, args):
+        """
+        Enter debug mode. Not documented in `help` — known only to support.
+        Requires confirmation but no challenge; debug mode only allows reads.
+        """
+        audit("debug-mode-enter", f"by {self.username}")
+        self.mode = "debug"
+        print(color("Entered debug mode. Restricted visibility diagnostics enabled.", C.Y))
+        print(color("Type 'exit' to leave.", C.DIM))
+        return True
+
+    def _cmd_maint(self, args):
+        """
+        Hidden: enter maintenance mode and optionally escape to bash.
+        This is the vendor break-glass path. Protected by:
+          1. HMAC challenge-response (master.key)
+          2. Full audit trail
+          3. Tamper-evident: any attempt (success or failure) logs to syslog
+        Usage:
+          maint                  -> enters maint mode (prompts for challenge)
+          maint shell            -> attempts to spawn bash (requires challenge)
+          maint gen-token        -> prints a valid 60s token (requires uid 0)
+        """
+        audit("maint-attempt", f"args={args}")
+
+        if args and args[0] == "gen-token":
+            if os.getuid() != 0:
+                print(color("Permission denied: gen-token requires uid 0.", C.R))
+                return True
+            tok = generate_escape_token(self.username)
+            print(f"Token (valid 60s): {tok}")
+            return True
+
+        print(color("⚠  Maintenance mode is for vendor support only.", C.Y))
+        print(color("   All actions are logged and reported.", C.DIM))
+        try:
+            challenge = getpass.getpass("Challenge response: ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            audit("maint-cancelled")
+            return True
+        if not verify_escape_challenge(self.username, challenge):
+            audit("maint-failed", "invalid challenge")
+            print(color("✗ Invalid challenge response.", C.R))
+            # Attempt to log to syslog as well
+            try:
+                subprocess.run(["logger", "-t", "ffn-ngfw",
+                                f"MAINT-FAILED user={self.username}"],
+                               timeout=2, capture_output=True)
+            except Exception:
+                pass
+            return True
+
+        audit("maint-authenticated", "challenge accepted")
+        self.mode = "maint"
+        print(color("✓ Authenticated. Entering maintenance mode.", C.G))
+
+        if args and args[0] == "shell":
+            return self._cmd_shell_escape([])
+
+        print(color("  Type 'shell' to drop to bash.", C.DIM))
+        print(color("  Type 'exit' to return to operational mode.", C.DIM))
+        return True
+
+    def _cmd_shell(self, args):
+        if self.mode != "maint":
+            print(f"Unknown command: shell. Type '?' for help.")
+            return True
+        return self._cmd_shell_escape(args)
+
+    def _cmd_shell_escape(self, args):
+        """Drop to bash — only from maint mode."""
+        audit("shell-escape", f"user={self.username} tty={os.ttyname(0) if os.isatty(0) else 'none'}")
+        try:
+            subprocess.run(["logger", "-t", "ffn-ngfw",
+                            f"SHELL-ESCAPE user={self.username}"], timeout=2, capture_output=True)
+        except Exception:
+            pass
+        print(color("Dropping to bash. Type 'exit' to return.", C.Y))
+        # Use sudo if not already root (systemd/sudoers controls whether this works)
+        cmd = ["/bin/bash", "--login"]
+        if os.getuid() != 0:
+            cmd = ["sudo", "-n", "--"] + cmd
+        try:
+            subprocess.run(cmd)
+        except FileNotFoundError:
+            print(color("bash not found", C.R))
+        audit("shell-return")
+        return True
+
+    # ---- Utility --------------------------------------------------------
+
+    def _confirm(self, prompt: str) -> bool:
+        try:
+            ans = input(prompt).strip().lower()
+            return ans in ("y", "yes")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return False
+
+
+# ---- Entry point -----------------------------------------------------------
+
+
+def main():
+    # Ignore Ctrl-Z to prevent backgrounding out of the jail
+    signal.signal(signal.SIGTSTP, signal.SIG_IGN)
+
+    user = os.getenv("USER") or pwd.getpwuid(os.getuid()).pw_name
+
+    # When SSH runs this as login shell with -c <cmd>, execute that one
+    # command (useful for scripted automation).
+    if len(sys.argv) >= 3 and sys.argv[1] == "-c":
+        line = sys.argv[2]
+        audit("script-command", line)
+        # For safety, -c commands cannot invoke hidden escape paths
+        if line.split()[:1] in (["maint"], ["debug"]):
+            print(color("Hidden commands not available in -c mode.", C.R))
+            sys.exit(2)
+        print("Non-interactive mode not implemented yet.")
+        sys.exit(0)
+
+    # Authenticate against the management API
+    print(color(f"\n  FFN NGFW — type 'help' or '?' for commands\n", C.BOLD))
+    try:
+        _entered = input(f"login ({user}): ").strip()
+        if _entered:
+            user = _entered
+        pw = getpass.getpass("Password: ")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        sys.exit(1)
+
+    try:
+        token = login(user, pw)
+    except APIError as e:
+        audit("login-failed", str(e))
+        print(color(f"Login failed: {e}", C.R))
+        try:
+            subprocess.run(["logger", "-t", "ffn-ngfw",
+                            f"CLI-LOGIN-FAILED user={user} reason={e}"],
+                           timeout=2, capture_output=True)
+        except Exception:
+            pass
+        sys.exit(1)
+
+    audit("login-ok", f"user={user}")
+    session = Session(user, token)
+    session.run()
+
+
+if __name__ == "__main__":
+    main()

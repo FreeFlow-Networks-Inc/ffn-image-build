@@ -1,0 +1,43 @@
+# Generated build output. build.sh recreates all of this; none of it belongs in
+# git, and out/ alone reached 53 GB on the build server.
+out/
+recovery/
+rootfs/
+buildroot-*/
+busybox-*/
+*.img
+*.img.gz
+*.qcow2
+*.raw
+*.tar.zst
+*.sha256
+
+# Upstream sources the build downloads for itself.
+payload/dpdk-src.tar.xz
+buildroot-*.tar.xz
+
+# The harvested FFN payload. This is the one that must NOT be tracked, and not
+# only for size: build.sh tars /opt/ffn-ngfw-v2 off whichever live box it runs
+# on, which is how a build host's own configuration ends up inside an appliance
+# image. The FFN software is published in FFN-NGFW (its opt/ directory), so a
+# build from a clean clone should assemble the payload from repo content instead
+# of harvesting a machine. Until it does, this file is a local build input only.
+payload/opt-ffn-ngfw-v2.tgz
+payload/opt-ffn-ngfw-v1.tgz
+
+# Buildroot output. Regenerate with dprootfs/ffn_octeon_defconfig; keeping an
+# 18 MB squashfs in git would freeze a build artifact as if it were source.
+dprootfs/*.squashfs
+
+# Timestamped safety copies made while editing on a live box.
+*.bak
+*.bak-*
+*.pre-*
+*.orig
+*.rej
+__pycache__/
+*.pyc
+
+# Compiled MIPS64 outputs whose source sits beside them (dpagent/*.c).
+dpagent/ffn_dpagent
+dpagent/ffn_dpagent2

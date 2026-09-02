@@ -1,0 +1,14 @@
+[Unit]
+Description=FFN NGFW nftables dataplane (vsys ct-zones + interface-management profiles)
+Documentation=file:/etc/ffn-ngfw/ffn-bmfw.nft
+Before=network-pre.target
+Wants=network-pre.target
+DefaultDependencies=no
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/ffn-ngfw/ffn-bmfw.nft
+ExecReload=/usr/sbin/nft -f /etc/ffn-ngfw/ffn-bmfw.nft
+ExecStop=/usr/sbin/nft delete table inet ffn_ngfw
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,50 @@
+/*
+ * Counter access is 64-bit-atomic on purpose.
+ *
+ * The CP reads these fields through a PCIe window that byte-reverses each aligned
+ * 64-bit word, so it necessarily loads a WHOLE 8-byte group at a time. The previous
+ * wr32() published a counter as four separate byte stores, which the CP could catch
+ * half-updated. That is not theoretical: taking out_head from 0x0000FFFF to
+ * 0x00010000 stores MSB-first, so a CP read landing after two bytes sees
+ * 0x0001FFFF -- 65535 larger than the true value. The CP then reads ring bytes that
+ * were never written and drives its tail past head, which is the unrecoverable
+ * overshoot state.
+ *
+ * Fix: one 64-bit load and one 64-bit store, so the CP can never observe a partial
+ * value. The read-modify-write is safe because every group these functions touch is
+ * written ONLY by this side (see the layout comment) -- the CP owns in_head and
+ * out_tail and we never write those. Reading as one 64-bit load also closes the
+ * mirror case, where a byte-at-a-time read here could tear a CP-written counter.
+ *
+ * Big-endian: the u32 at a group's base occupies the HIGH half of the u64; the one
+ * at +4 occupies the low half.
+ */
+static uint32_t rd32(unsigned off)
+{
+	volatile uint64_t *g = (volatile uint64_t *)(ring + (off & ~7u));
+	uint64_t cur = *g;
+
+	return (off & 4u) ? (uint32_t)cur : (uint32_t)(cur >> 32);
+}
+
+static void wr32(unsigned off, uint32_t v)
+{
+	volatile uint64_t *g = (volatile uint64_t *)(ring + (off & ~7u));
+	uint64_t cur = *g;
+
+	if (off & 4u)
+		cur = (cur & 0xffffffff00000000ull) | (uint64_t)v;
+	else
+		cur = (cur & 0x00000000ffffffffull) | ((uint64_t)v << 32);
+	*g = cur;
+}
+
+/*
+ * Store barrier. The ring payload must be visible to the CP BEFORE the head that
+ * advertises it, otherwise the CP is told about bytes it cannot yet read. v1 of this
+ * agent had such a barrier and v2 lost it; this puts it back.
+ */
+static inline void dp_sync(void)
+{
+	__asm__ __volatile__("sync" ::: "memory");
+}

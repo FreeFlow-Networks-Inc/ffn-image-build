@@ -1,0 +1,11 @@
+[Unit]
+Description=Hourly FFN-NGFW signature feed check (each feed honors its own refresh cadence)
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=10m
+Persistent=yes
+Unit=ffn-sigdb-update.service
+
+[Install]
+WantedBy=timers.target

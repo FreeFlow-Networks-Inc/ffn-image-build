@@ -1,0 +1,82 @@
+--- arch/mips/cavium-octeon/setup.c.ffn-bak-coremask	2026-08-28 04:12:58.711577413 +0000
++++ arch/mips/cavium-octeon/setup.c	2026-08-28 04:49:37.394750364 +0000
+@@ -704,24 +704,70 @@
+ 		 * The 32-bit core_mask IS filled on this path (the bootloader
+ 		 * prints it as 0xf here), so prefer it when ext looks wrong.
+ 		 */
+-		if (!OCTEON_IS_MODEL(OCTEON_CN78XX) &&
+-		    cvmx_coremask_get_last_core(&sysinfo->core_mask) >=
++		/*
++		 * FFN: this applies to CN78XX too. The DP (CN7885) is a
++		 * single-node part booted over PCIe, where ext_core_mask is
++		 * never initialised; excluding CN78XX here left the kernel
++		 * believing node 1 had CPUs, which panics a NUMA=n build in
++		 * octeon_memory_init() and NULL-derefs octeon_ciu3_mbox_send()
++		 * in a NUMA=y build. A genuine multi-node CCPI system is not
++		 * booted this way.
++		 */
++		if (cvmx_coremask_get_last_core(&sysinfo->core_mask) >=
+ 		    CVMX_COREMASK_MAX_CORES_PER_NODE) {
+-			pr_info("FFN: ext_core_mask not credible, using core_mask 0x%x\n",
++			u64 cand;
++			int w, ncores, chosen = -1;
++
++			pr_info("FFN: ext_core_mask raw %016llx %016llx %016llx %016llx, core_mask 0x%x\n",
++				(unsigned long long)sysinfo->core_mask.coremask_bitmap[0],
++				(unsigned long long)sysinfo->core_mask.coremask_bitmap[1],
++				(unsigned long long)sysinfo->core_mask.coremask_bitmap[2],
++				(unsigned long long)sysinfo->core_mask.coremask_bitmap[3],
+ 				octeon_bootinfo->core_mask);
++
++			/*
++			 * Identify the genuine mask by content, not by offset: it must
++			 * agree with the 32-bit core_mask over the cores they both
++			 * describe, be non-empty, and fit in one node. This loader puts
++			 * it where our struct expects word 3.
++			 */
++			for (w = 0; w < CVMX_COREMASK_USED_BMPSZ; w++) {
++				cand = sysinfo->core_mask.coremask_bitmap[w];
++				if (!cand)
++					continue;
++				if ((u32)(cand & 0xffffffffull) !=
++					octeon_bootinfo->core_mask)
++					continue;
++				if (__builtin_popcountll(cand) >
++					CVMX_COREMASK_MAX_CORES_PER_NODE)
++					continue;
++				chosen = w;
++				break;
++			}
++
+ 			memset(&sysinfo->core_mask, 0, sizeof(sysinfo->core_mask));
+-			cvmx_coremask_set64(&sysinfo->core_mask,
+-					    octeon_bootinfo->core_mask);
++			if (chosen >= 0) {
++				cvmx_coremask_set64(&sysinfo->core_mask, cand);
++				ncores = cvmx_coremask_get_core_count(&sysinfo->core_mask);
++				pr_info("FFN: coremask found in word %d: %016llx (%d cores)\n",
++					chosen, (unsigned long long)cand, ncores);
++			} else {
++				cvmx_coremask_set64(&sysinfo->core_mask,
++					octeon_bootinfo->core_mask);
++				pr_info("FFN: no credible ext word, using core_mask 0x%x\n",
++					octeon_bootinfo->core_mask);
++			}
+ 		}
+ 	} else {
+ 		cvmx_coremask_set64(&sysinfo->core_mask,
+ 				    octeon_bootinfo->core_mask);
+ 	}
+ 
+-	/* Some broken u-boot pass garbage in upper bits, clear them out */
+-	if (!OCTEON_IS_MODEL(OCTEON_CN78XX))
+-		for (i = 512; i < 1024; i++)
+-			cvmx_coremask_clear_core(&sysinfo->core_mask, i);
++	/* Some broken u-boot pass garbage in upper bits, clear them out.
++	 * FFN: also done for CN78XX, for the reason given above.
++	 */
++	for (i = 512; i < 1024; i++)
++		cvmx_coremask_clear_core(&sysinfo->core_mask, i);
+ 
+ 	sysinfo->exception_base_addr = octeon_bootinfo->exception_base_addr;
+ 	sysinfo->cpu_clock_hz = octeon_bootinfo->eclock_hz;

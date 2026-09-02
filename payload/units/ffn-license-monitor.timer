@@ -1,0 +1,14 @@
+[Unit]
+Description=Run FFN-NGFW license-expiry check daily
+
+[Timer]
+# Daily at 06:00 local with up to 30 min jitter so a fleet of FPGAs
+# doesn't all hit the same moment.  Persistent=yes catches up missed
+# runs after a host was off (e.g. maintenance window spanning 06:00).
+OnCalendar=*-*-* 06:00:00
+RandomizedDelaySec=30m
+Persistent=yes
+Unit=ffn-license-monitor.service
+
+[Install]
+WantedBy=timers.target
