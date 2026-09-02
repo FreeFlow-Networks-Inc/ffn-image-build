@@ -240,8 +240,19 @@ stop_arrays_on(){
 OS_P_BIOS=1
 OS_P_ROOT=2
 OS_P_RECOVERY=3
+OS_P_NFS=4
 
-part_os(){   # $1 = disk, $2 = end of the root partition, $3 = end of recovery
+# Fixed sizes, not proportions. Root matches the image build's
+# IMG_P1_END so a disk installed here and one installed from the image
+# agree; recovery is a maintenance environment and 8 GiB is ample; the
+# remainder becomes mirrored NFS space for the OCTEON planes rather than
+# being absorbed by recovery.
+OS_ROOT_END_MIB=81920      # 80 GiB
+OS_RECOVERY_END_MIB=90112  # +8 GiB
+NFS_MNT=/opt/ffn-nfs
+NFS_LABEL=ffn-nfs
+
+part_os(){   # $1 = disk, $2 = root end, $3 = recovery end, $4 = nfs end
 	wipefs -a "$1"
 	# GPT, not msdos. On a GPT disk there is no post-MBR gap for core.img, so
 	# BIOS-mode GRUB needs a 1 MiB ef02 partition or grub-install --target=i386-pc
@@ -257,9 +268,14 @@ part_os(){   # $1 = disk, $2 = end of the root partition, $3 = end of recovery
 	parted -s "$1" set $OS_P_BIOS bios_grub on
 	parted -s "$1" mkpart primary ext4 2MiB "$2"
 	parted -s "$1" mkpart primary ext4 "$2" "$3"
+	# The remainder: mirrored NFS space for the OCTEON control and data plane
+	# root filesystems. Their own initramfs is RAM-backed, so anything they
+	# install has to live on the host's disk to survive a reboot.
+	parted -s "$1" mkpart primary ext4 "$3" "$4"
 	if [ "$OS_RAID" = 1 ]; then
 		parted -s "$1" set $OS_P_ROOT raid on
 		parted -s "$1" set $OS_P_RECOVERY raid on
+		parted -s "$1" set $OS_P_NFS raid on
 	fi
 	partprobe "$1"; sleep 2
 }
@@ -282,9 +298,14 @@ if [ "$OS_RAID" = 1 ]; then
 		[ "$s" -lt "$SMALL" ] && SMALL=$s
 	done
 	USABLE_MIB=$(( SMALL / 1048576 - 64 ))
-	[ "$USABLE_MIB" -gt 12288 ] || die "OS disks too small: ${USABLE_MIB}MiB usable"
+	# Need root + recovery + something worth having for the planes.
+	[ "$USABLE_MIB" -gt $(( OS_RECOVERY_END_MIB + 4096 )) ] \
+		|| die "OS disks too small: ${USABLE_MIB}MiB usable, need > $(( OS_RECOVERY_END_MIB + 4096 ))MiB"
 	echo "-- partitioning ${OS_DISKS[*]} (GPT, RAID members; ${USABLE_MIB}MiB usable) --"
-	for d in "${OS_DISKS[@]}"; do part_os "$d" "9216MiB" "${USABLE_MIB}MiB"; done
+	echo "   root ${OS_ROOT_END_MIB}MiB / recovery $(( OS_RECOVERY_END_MIB - OS_ROOT_END_MIB ))MiB / nfs $(( USABLE_MIB - OS_RECOVERY_END_MIB ))MiB"
+	for d in "${OS_DISKS[@]}"; do
+		part_os "$d" "${OS_ROOT_END_MIB}MiB" "${OS_RECOVERY_END_MIB}MiB" "${USABLE_MIB}MiB"
+	done
 	echo "-- creating OS mirrors (metadata 1.0) --"
 	mdadm --create --run --verbose /dev/md0 --level=1 --raid-devices=2 \
 	      --metadata=1.0 --homehost=ffn --name=ffn-root \
@@ -292,16 +313,21 @@ if [ "$OS_RAID" = 1 ]; then
 	mdadm --create --run --verbose /dev/md1 --level=1 --raid-devices=2 \
 	      --metadata=1.0 --homehost=ffn --name=ffn-recovery \
 	      "$(pname "${OS_DISKS[0]}" $OS_P_RECOVERY)" "$(pname "${OS_DISKS[1]}" $OS_P_RECOVERY)"
-	P1=/dev/md0; P2=/dev/md1
+	mdadm --create --run --verbose /dev/md2 --level=1 --raid-devices=2 \
+	      --metadata=1.0 --homehost=ffn --name=$NFS_LABEL \
+	      "$(pname "${OS_DISKS[0]}" $OS_P_NFS)" "$(pname "${OS_DISKS[1]}" $OS_P_NFS)"
+	P1=/dev/md0; P2=/dev/md1; P3=/dev/md2
 else
-	echo "-- partitioning ${OS_DISKS[0]} (GPT: bios_grub + root + recovery) --"
-	part_os "${OS_DISKS[0]}" 9GiB 100%
+	echo "-- partitioning ${OS_DISKS[0]} (GPT: bios_grub + root + recovery + nfs) --"
+	part_os "${OS_DISKS[0]}" "${OS_ROOT_END_MIB}MiB" "${OS_RECOVERY_END_MIB}MiB" 100%
 	P1=$(pname "${OS_DISKS[0]}" $OS_P_ROOT)
 	P2=$(pname "${OS_DISKS[0]}" $OS_P_RECOVERY)
+	P3=$(pname "${OS_DISKS[0]}" $OS_P_NFS)
 fi
 
 mkfs.ext4 -q -F -L ffn-root     "$P1"
 mkfs.ext4 -q -F -L ffn-recovery "$P2"
+mkfs.ext4 -q -F -L "$NFS_LABEL"  "$P3"
 
 # ---------------------------------------------------------- log volume -------
 LOG_DEV=""
@@ -348,6 +374,18 @@ if [ -n "$LOG_DEV" ]; then
 		|| echo "LABEL=$LOG_LABEL  $LOG_MNT  ext4  defaults,noatime,nofail  0  2" >> "$MNT/etc/fstab"
 	echo "-- fstab: LABEL=$LOG_LABEL -> $LOG_MNT (nofail, so a missing log volume never blocks boot) --"
 fi
+
+# NFS space for the OCTEON planes. Mounted by LABEL with nofail: an absent
+# volume must never stop the firewall booting, the same reasoning as the log
+# volume. cproot/ and dproot/ are created now so the export config and
+# ffn-nfsroot.sh have somewhere to point on first boot.
+mkdir -p "$MNT$NFS_MNT"
+grep -q "$NFS_MNT" "$MNT/etc/fstab" 2>/dev/null \
+	|| echo "LABEL=$NFS_LABEL  $NFS_MNT  ext4  defaults,noatime,nofail  0  2" >> "$MNT/etc/fstab"
+NFSTMP=$(mktemp -d)
+mount "$P3" "$NFSTMP" && { mkdir -p "$NFSTMP/cproot" "$NFSTMP/dproot"; umount "$NFSTMP"; }
+rmdir "$NFSTMP" 2>/dev/null || true
+echo "-- fstab: LABEL=$NFS_LABEL -> $NFS_MNT (cproot/ + dproot/ created) --"
 
 echo "-- installing GRUB (main + recovery entries) --"
 KVER=$(ls "$MNT/boot"/vmlinuz-* | sed 's#.*/vmlinuz-##' | sort | tail -1)

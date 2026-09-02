@@ -207,7 +207,12 @@ fi
 # The CP and DP take their rootfs from the MP's SSD over PCIC. Exports are
 # scoped to the PCIC subnet only; NFS must never be reachable from the
 # management network.
+# /opt/ffn-nfs is its own mirrored volume created by install-to-disk.sh; these
+# are the mountpoint directories, shadowed by that mount at runtime. The
+# planes' roots live there rather than on the system partition, so anything
+# they install survives a reboot without competing with the firewall for disk.
 mkdir -p /opt/dpfs /opt/var.cp /opt/var.dp0 /opt/var.dp1 /opt/var.dp2
+mkdir -p /opt/ffn-nfs/cproot /opt/ffn-nfs/dproot
 cat > /etc/exports <<'EOF'
 # FFN: NFS root for the OCTEON control/data planes.
 # Restricted to the CP/DP address space, as PAN-OS does. NFS must never be
@@ -219,6 +224,10 @@ cat > /etc/exports <<'EOF'
 /opt/var.dp0 127.1.0.0/16(rw,sync,no_root_squash,no_subtree_check)
 /opt/var.dp1 127.1.0.0/16(rw,sync,no_root_squash,no_subtree_check)
 /opt/var.dp2 127.1.0.0/16(rw,sync,no_root_squash,no_subtree_check)
+# FFN-built plane roots on the dedicated mirrored volume. Same client
+# scoping: the PCIC subnet only, never the management network.
+/opt/ffn-nfs/cproot 127.1.0.0/16(rw,sync,no_root_squash,no_subtree_check)
+/opt/ffn-nfs/dproot 127.1.0.0/16(rw,sync,no_root_squash,no_subtree_check)
 EOF
 # Pin nfsd to the PCIC subnet. Not a substitute for the firewall rule -- if the
 # PCIC interface is absent at boot nfsd falls back to all addresses, which is
