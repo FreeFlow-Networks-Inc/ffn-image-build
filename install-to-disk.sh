@@ -237,7 +237,7 @@ stop_arrays_on(){
 	# assemble FROM), then re-check, up to a few rounds. Zeroing is safe here
 	# because every caller passes disks the operator has already confirmed for
 	# erasure -- this runs after the ERASE prompt.
-	local d base md p round left
+	local d base md p round left mdname mp
 	for round in 1 2 3 4 5; do
 		left=0
 		for d in "$@"; do
@@ -245,8 +245,17 @@ stop_arrays_on(){
 			for md in /sys/block/md*; do
 				[ -d "$md" ] || continue
 				if ls "$md"/slaves 2>/dev/null | grep -q "^${base}[0-9p]*$"; then
-					echo "-- stopping /dev/$(basename "$md") (member on $d) --"
-					mdadm --stop "/dev/$(basename "$md")" >/dev/null 2>&1 || true
+					mdname=$(basename "$md")
+					# An array with a MOUNTED filesystem will not stop, and a
+					# previous failed run leaves its mktemp mount behind -- which
+					# presents as an unstoppable array for no visible reason.
+					# Release it first; these disks are already confirmed for erasure.
+					for mp in $(awk -v dv="/dev/$mdname" '$1==dv{print $2}' /proc/self/mounts); do
+						echo "-- releasing $mp (mounted from /dev/$mdname) --"
+						umount "$mp" 2>/dev/null || umount -l "$mp" 2>/dev/null || true
+					done
+					echo "-- stopping /dev/$mdname (member on $d) --"
+					mdadm --stop "/dev/$mdname" >/dev/null 2>&1 || true
 					left=1
 				fi
 			done
@@ -571,33 +580,50 @@ if [ "$OS_RAID" = 1 ]; then
 	echo
 	echo "-- verifying the arrays cold-assemble from on-disk metadata --"
 	sync
-	VERIFY_MDS=""
-	for m in /dev/md0 /dev/md1 /dev/md2 /dev/md3; do
-		[ -b "$m" ] && VERIFY_MDS="$VERIFY_MDS $m"
+	# Check IDENTITY, never device paths. An array reassembled by scan comes back
+	# under whatever minor is free -- md0 becomes md124, md1 becomes md125 and so
+	# on -- which is the same "md9 -> md127" renumbering noted further up. A
+	# path-based check reports a perfectly healthy mirror as a failure.
+	VERIFY_UUIDS=$(mdadm --detail --scan 2>/dev/null | sed -n 's/.*UUID=\([^ ]*\).*/\1/p' | sort -u)
+	[ -n "$VERIFY_UUIDS" ] || die "no arrays to verify, yet OS_RAID=1"
+	for m in /dev/md*; do
+		[ -b "$m" ] && { mdadm --stop "$m" >/dev/null 2>&1 || true; }
 	done
-	for m in $VERIFY_MDS; do mdadm --stop "$m" >/dev/null 2>&1 || true; done
 	# --run so a legitimately degraded array still counts as assembled.
 	mdadm --assemble --scan --run >/dev/null 2>&1 || true
+	sleep 2
+	BACK=$(mdadm --detail --scan 2>/dev/null | sed -n 's/.*UUID=\([^ ]*\).*/\1/p' | sort -u)
 	VERIFY_FAIL=0
-	for m in $VERIFY_MDS; do
-		if [ -b "$m" ]; then
-			echo "   OK   $m re-assembled"
+	for u in $VERIFY_UUIDS; do
+		if echo "$BACK" | grep -qx "$u"; then
+			echo "   OK   array $u re-assembled"
 		else
-			echo "   FAIL $m did NOT re-assemble from its own metadata"
+			echo "   FAIL array $u did NOT re-assemble from its own metadata"
 			VERIFY_FAIL=1
 		fi
 	done
+	# The labels are what fstab and the initramfs actually search for, so prove
+	# those resolve too -- an assembled array with an unreadable filesystem would
+	# still strand the box.
+	for l in ffn-root ffn-recovery "$NFS_LABEL"; do
+		d=$(blkid -L "$l" 2>/dev/null)
+		case "$d" in
+			/dev/md*) echo "   OK   LABEL=$l -> $d" ;;
+			*)        echo "   FAIL LABEL=$l did not resolve to an md device (got: ${d:-nothing})"
+			          VERIFY_FAIL=1 ;;
+		esac
+	done
 	if [ "$VERIFY_FAIL" = 1 ]; then
 		echo
-		echo "REFUSING to report success: an array cannot be assembled from the"
-		echo "metadata now on disk, so this box would stop at an initramfs prompt."
+		echo "REFUSING to report success: an array or label cannot be recovered from"
+		echo "the metadata now on disk, so this box would stop at an initramfs prompt."
 		echo "Collect before re-running:"
 		echo "  mdadm --examine <each member>"
 		echo "  blockdev --getsz <each member>"
 		cat /proc/mdstat
 		exit 1
 	fi
-	echo "-- all arrays verified --"
+	echo "-- all arrays verified (identity + labels; minors may renumber, that is fine) --"
 fi
 
 echo
