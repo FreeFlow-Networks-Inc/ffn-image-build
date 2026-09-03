@@ -49,7 +49,12 @@ die(){ echo "ERROR: $*" >&2; exit 1; }
 
 # Standalone installer: it does NOT source config.sh, so give the console baud
 # its own default. Appliance chassis (PA-3200/PA-5200) run 9600:
-#     FFN_SERIAL_BAUD=9600 sudo -E ./install-to-disk.sh
+#     sudo FFN_SERIAL_BAUD=9600 ./install-to-disk.sh
+#   NOT `sudo -E`: many sudo builds are compiled without SETENV and print
+#   "preserving the entire environment is not supported, '-E' is ignored",
+#   so the variable silently never reaches the script. With FFN_ASSUME_YES
+#   that means it drops into the interactive prompts instead and dies on a
+#   closed stdin. Pass the assignments as sudo ARGUMENTS, as above.
 FFN_SERIAL_BAUD="${FFN_SERIAL_BAUD:-115200}"
 FFN_ASSUME_YES="${FFN_ASSUME_YES:-0}"
 
@@ -223,15 +228,44 @@ fi
 # log mirror assembled would tear that down too -- not something an installer
 # aimed at specific disks has any business doing.
 stop_arrays_on(){
-	local d base md
+	# Stopping an array is not enough on its own: udev's INCREMENTAL ASSEMBLY
+	# re-creates it from the surviving superblocks within moments, so a single
+	# pass races udev and partitioning then dies with
+	#   wipefs: error: /dev/sdX: probing initialization failed: Device or resource busy
+	# Observed on a re-image of disks that already carried our own arrays.
+	# So: stop, then zero the members' superblocks (leaving udev nothing to
+	# assemble FROM), then re-check, up to a few rounds. Zeroing is safe here
+	# because every caller passes disks the operator has already confirmed for
+	# erasure -- this runs after the ERASE prompt.
+	local d base md p round left
+	for round in 1 2 3 4 5; do
+		left=0
+		for d in "$@"; do
+			base=$(basename "$d")
+			for md in /sys/block/md*; do
+				[ -d "$md" ] || continue
+				if ls "$md"/slaves 2>/dev/null | grep -q "^${base}[0-9p]*$"; then
+					echo "-- stopping /dev/$(basename "$md") (member on $d) --"
+					mdadm --stop "/dev/$(basename "$md")" >/dev/null 2>&1 || true
+					left=1
+				fi
+			done
+		done
+		[ "$left" = 0 ] && return 0
+		for d in "$@"; do
+			for p in "$d"[0-9]* "${d}p"[0-9]*; do
+				[ -b "$p" ] && { mdadm --zero-superblock "$p" >/dev/null 2>&1 || true; }
+			done
+		done
+		sleep 1
+	done
+	# Last resort: say so rather than let partitioning fail with a confusing
+	# "resource busy" several steps later.
 	for d in "$@"; do
 		base=$(basename "$d")
 		for md in /sys/block/md*; do
 			[ -d "$md" ] || continue
-			if ls "$md"/slaves 2>/dev/null | grep -q "^${base}[0-9p]*$"; then
-				echo "-- stopping /dev/$(basename "$md") (member on $d) --"
-				mdadm --stop "/dev/$(basename "$md")" >/dev/null 2>&1 || true
-			fi
+			ls "$md"/slaves 2>/dev/null | grep -q "^${base}[0-9p]*$" 				&& die "cannot release /dev/$(basename "$md") from $d; stop it by hand and re-run"
 		done
 	done
 }
@@ -297,7 +331,15 @@ part_os(){   # $1 = disk, $2 = root end, $3 = recovery end, $4 = nfs end, $5 = l
 stop_arrays_on "${OS_DISKS[@]}"
 if [ "$OS_RAID" = 1 ]; then
 	for d in "${OS_DISKS[@]}"; do
-		for n in $OS_P_ROOT $OS_P_RECOVERY; do mdadm --zero-superblock "$(pname "$d" "$n")" >/dev/null 2>&1 || true; done
+		# Zero EVERY member we are about to build on, and the whole disk too.
+		# This used to clear only p2 and p3, so a stale superblock on p4, p5 or
+		# the raw device survived an install and could be auto-assembled later
+		# as a foreign array claiming space we had just partitioned. Reclaimed
+		# SSDs arrive carrying someone else's metadata; assume nothing.
+		for n in $OS_P_ROOT $OS_P_RECOVERY $OS_P_NFS $OS_P_LOGS; do
+			mdadm --zero-superblock "$(pname "$d" "$n")" >/dev/null 2>&1 || true
+		done
+		mdadm --zero-superblock "$d" >/dev/null 2>&1 || true
 	done
 	# Identical explicit sizes derived from the SMALLER disk. The two SSDs in a
 	# reclaimed chassis are usually different models and differ by a few MB;
@@ -473,6 +515,14 @@ fi
 if [ "$OS_RAID" = 1 ]; then
 	chroot "$MNT" sh -c 'command -v update-initramfs >/dev/null' \
 		|| die "target image has no update-initramfs; cannot build a RAID-capable initrd"
+	# A degraded array is the exact case a mirror exists for, and Ubuntu's
+	# initramfs REFUSES to start one unless told to. Without this a single
+	# failed disk drops the appliance to an (initramfs) prompt instead of
+	# booting, which defeats the entire point of mirroring root. Observed
+	# twice on real hardware, both times with perfectly valid metadata.
+	mkdir -p "$MNT/etc/initramfs-tools/conf.d"
+	echo "BOOT_DEGRADED=true" > "$MNT/etc/initramfs-tools/conf.d/mdadm"
+	echo "-- BOOT_DEGRADED=true (boots on one leg rather than halting) --"
 	chroot "$MNT" update-initramfs -u -k all
 	# core.img must read a 1.x superblock member before the initrd exists, and
 	# GRUB goes on BOTH disks so the box still boots with either one pulled.
@@ -511,6 +561,44 @@ sync
 unmount_tree "$MNT"
 unmount_tree "$MNT2"
 rmdir "$MNT" "$MNT2" 2>/dev/null || true
+
+# ------------------------------------------------ verify the arrays ----------
+# Declaring success without this is how a box that cannot assemble its own
+# root reaches a rack. Stop every array we built and re-assemble it from the
+# on-disk metadata ALONE -- exactly what the initramfs must do at boot, with
+# none of our mdadm.conf in play yet.
+if [ "$OS_RAID" = 1 ]; then
+	echo
+	echo "-- verifying the arrays cold-assemble from on-disk metadata --"
+	sync
+	VERIFY_MDS=""
+	for m in /dev/md0 /dev/md1 /dev/md2 /dev/md3; do
+		[ -b "$m" ] && VERIFY_MDS="$VERIFY_MDS $m"
+	done
+	for m in $VERIFY_MDS; do mdadm --stop "$m" >/dev/null 2>&1 || true; done
+	# --run so a legitimately degraded array still counts as assembled.
+	mdadm --assemble --scan --run >/dev/null 2>&1 || true
+	VERIFY_FAIL=0
+	for m in $VERIFY_MDS; do
+		if [ -b "$m" ]; then
+			echo "   OK   $m re-assembled"
+		else
+			echo "   FAIL $m did NOT re-assemble from its own metadata"
+			VERIFY_FAIL=1
+		fi
+	done
+	if [ "$VERIFY_FAIL" = 1 ]; then
+		echo
+		echo "REFUSING to report success: an array cannot be assembled from the"
+		echo "metadata now on disk, so this box would stop at an initramfs prompt."
+		echo "Collect before re-running:"
+		echo "  mdadm --examine <each member>"
+		echo "  blockdev --getsz <each member>"
+		cat /proc/mdstat
+		exit 1
+	fi
+	echo "-- all arrays verified --"
+fi
 
 echo
 echo "DONE. Reboot into the appliance."
