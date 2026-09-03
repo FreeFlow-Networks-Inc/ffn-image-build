@@ -444,8 +444,31 @@ else
 fi
 
 chroot "$MNT" grub-mkconfig -o /boot/grub/grub.cfg
-umount -R "$MNT/dev" 2>/dev/null || true; umount "$MNT/sys" "$MNT/proc" 2>/dev/null || true
-umount "$MNT" "$MNT2"; rmdir "$MNT" "$MNT2"
+# Cleanup must never fail the install. Everything above has already been
+# written and synced; a busy mountpoint here is a transient reference held by a
+# helper that update-initramfs or grub-mkconfig spawned, not a problem with the
+# result. Previously `umount "$MNT" "$MNT2"` had no `|| true`, so set -e turned
+# a tidy-up hiccup into exit 32 on a completed install -- which reads as "the
+# install failed" and invites redoing it or discarding a good disk.
+unmount_tree(){   # $1 = mountpoint to release, deepest first
+	local mp="$1" i sub
+	[ -n "$mp" ] || return 0
+	# Deepest-first, so /dev/pts and /dev/shm go before /dev, and /dev before $MNT.
+	for sub in $(mount | awk -v m="$mp" '$3 ~ "^"m {print $3}' | sort -r); do
+		for i in 1 2 3; do
+			umount "$sub" 2>/dev/null && break
+			sleep 1
+		done
+		# Still held: detach lazily. The filesystem goes once the last
+		# descriptor closes, which is fine -- our writes are already done.
+		mountpoint -q "$sub" && umount -l "$sub" 2>/dev/null
+	done
+	return 0
+}
+sync
+unmount_tree "$MNT"
+unmount_tree "$MNT2"
+rmdir "$MNT" "$MNT2" 2>/dev/null || true
 
 echo
 echo "DONE. Reboot into the appliance."
