@@ -54,6 +54,7 @@ FFN_SERIAL_BAUD="${FFN_SERIAL_BAUD:-115200}"
 FFN_ASSUME_YES="${FFN_ASSUME_YES:-0}"
 
 LOG_MD=/dev/md9          # matches the existing appliance convention
+OS_LOG_DEV=""            # set when logs live on the OS disks rather than their own
 LOG_MNT=/opt/ffn-logs
 LOG_LABEL=ffn-logs
 
@@ -241,6 +242,7 @@ OS_P_BIOS=1
 OS_P_ROOT=2
 OS_P_RECOVERY=3
 OS_P_NFS=4
+OS_P_LOGS=5
 
 # Fixed sizes, not proportions. Root matches the image build's
 # IMG_P1_END so a disk installed here and one installed from the image
@@ -249,10 +251,14 @@ OS_P_NFS=4
 # being absorbed by recovery.
 OS_ROOT_END_MIB=81920      # 80 GiB
 OS_RECOVERY_END_MIB=90112  # +8 GiB
+# NFS gets a fixed 32 GiB rather than the remainder. The planes' roots are
+# ~80 MB trees, so 32 GiB is room to install into both many times over, and
+# log space is the scarcer resource once the chassis 2 TB log pair is absent.
+OS_NFS_END_MIB=122880      # +32 GiB
 NFS_MNT=/opt/ffn-nfs
 NFS_LABEL=ffn-nfs
 
-part_os(){   # $1 = disk, $2 = root end, $3 = recovery end, $4 = nfs end
+part_os(){   # $1 = disk, $2 = root end, $3 = recovery end, $4 = nfs end, $5 = logs end ("" = none)
 	wipefs -a "$1"
 	# GPT, not msdos. On a GPT disk there is no post-MBR gap for core.img, so
 	# BIOS-mode GRUB needs a 1 MiB ef02 partition or grub-install --target=i386-pc
@@ -272,10 +278,17 @@ part_os(){   # $1 = disk, $2 = root end, $3 = recovery end, $4 = nfs end
 	# root filesystems. Their own initramfs is RAM-backed, so anything they
 	# install has to live on the host's disk to survive a reboot.
 	parted -s "$1" mkpart primary ext4 "$3" "$4"
+	# Logs, when no dedicated log disks were chosen. Without the chassis 2 TB
+	# pair there is no array for ffn-logvol.sh to discover, and logs would
+	# otherwise fill the root filesystem.
+	if [ -n "${5:-}" ]; then
+		parted -s "$1" mkpart primary ext4 "$4" "$5"
+	fi
 	if [ "$OS_RAID" = 1 ]; then
 		parted -s "$1" set $OS_P_ROOT raid on
 		parted -s "$1" set $OS_P_RECOVERY raid on
 		parted -s "$1" set $OS_P_NFS raid on
+		[ -n "${5:-}" ] && parted -s "$1" set $OS_P_LOGS raid on
 	fi
 	partprobe "$1"; sleep 2
 }
@@ -302,9 +315,17 @@ if [ "$OS_RAID" = 1 ]; then
 	[ "$USABLE_MIB" -gt $(( OS_RECOVERY_END_MIB + 4096 )) ] \
 		|| die "OS disks too small: ${USABLE_MIB}MiB usable, need > $(( OS_RECOVERY_END_MIB + 4096 ))MiB"
 	echo "-- partitioning ${OS_DISKS[*]} (GPT, RAID members; ${USABLE_MIB}MiB usable) --"
-	echo "   root ${OS_ROOT_END_MIB}MiB / recovery $(( OS_RECOVERY_END_MIB - OS_ROOT_END_MIB ))MiB / nfs $(( USABLE_MIB - OS_RECOVERY_END_MIB ))MiB"
+	# Only carve an on-disk log volume when no dedicated log disks were chosen,
+	# so nothing ever competes for the ffn-logs label.
+	if [ "${#LOG_DISKS[@]}" -eq 0 ]; then
+		OS_LOG_ARG="${USABLE_MIB}MiB"; NFS_END="${OS_NFS_END_MIB}MiB"
+		echo "   root ${OS_ROOT_END_MIB}MiB / recovery $(( OS_RECOVERY_END_MIB - OS_ROOT_END_MIB ))MiB / nfs $(( OS_NFS_END_MIB - OS_RECOVERY_END_MIB ))MiB / logs $(( USABLE_MIB - OS_NFS_END_MIB ))MiB"
+	else
+		OS_LOG_ARG=""; NFS_END="${USABLE_MIB}MiB"
+		echo "   root ${OS_ROOT_END_MIB}MiB / recovery $(( OS_RECOVERY_END_MIB - OS_ROOT_END_MIB ))MiB / nfs $(( USABLE_MIB - OS_RECOVERY_END_MIB ))MiB (logs on dedicated disks)"
+	fi
 	for d in "${OS_DISKS[@]}"; do
-		part_os "$d" "${OS_ROOT_END_MIB}MiB" "${OS_RECOVERY_END_MIB}MiB" "${USABLE_MIB}MiB"
+		part_os "$d" "${OS_ROOT_END_MIB}MiB" "${OS_RECOVERY_END_MIB}MiB" "$NFS_END" "$OS_LOG_ARG"
 	done
 	echo "-- creating OS mirrors (metadata 1.0) --"
 	mdadm --create --run --verbose /dev/md0 --level=1 --raid-devices=2 \
@@ -316,10 +337,21 @@ if [ "$OS_RAID" = 1 ]; then
 	mdadm --create --run --verbose /dev/md2 --level=1 --raid-devices=2 \
 	      --metadata=1.0 --homehost=ffn --name=$NFS_LABEL \
 	      "$(pname "${OS_DISKS[0]}" $OS_P_NFS)" "$(pname "${OS_DISKS[1]}" $OS_P_NFS)"
+	if [ -n "$OS_LOG_ARG" ]; then
+		mdadm --create --run --verbose /dev/md3 --level=1 --raid-devices=2 \
+		      --metadata=1.0 --homehost=ffn --name=$LOG_LABEL \
+		      "$(pname "${OS_DISKS[0]}" $OS_P_LOGS)" "$(pname "${OS_DISKS[1]}" $OS_P_LOGS)"
+		OS_LOG_DEV=/dev/md3
+	fi
 	P1=/dev/md0; P2=/dev/md1; P3=/dev/md2
 else
 	echo "-- partitioning ${OS_DISKS[0]} (GPT: bios_grub + root + recovery + nfs) --"
-	part_os "${OS_DISKS[0]}" "${OS_ROOT_END_MIB}MiB" "${OS_RECOVERY_END_MIB}MiB" 100%
+	if [ "${#LOG_DISKS[@]}" -eq 0 ]; then
+		part_os "${OS_DISKS[0]}" "${OS_ROOT_END_MIB}MiB" "${OS_RECOVERY_END_MIB}MiB" "${OS_NFS_END_MIB}MiB" 100%
+		OS_LOG_DEV=$(pname "${OS_DISKS[0]}" $OS_P_LOGS)
+	else
+		part_os "${OS_DISKS[0]}" "${OS_ROOT_END_MIB}MiB" "${OS_RECOVERY_END_MIB}MiB" 100% ""
+	fi
 	P1=$(pname "${OS_DISKS[0]}" $OS_P_ROOT)
 	P2=$(pname "${OS_DISKS[0]}" $OS_P_RECOVERY)
 	P3=$(pname "${OS_DISKS[0]}" $OS_P_NFS)
@@ -328,6 +360,7 @@ fi
 mkfs.ext4 -q -F -L ffn-root     "$P1"
 mkfs.ext4 -q -F -L ffn-recovery "$P2"
 mkfs.ext4 -q -F -L "$NFS_LABEL"  "$P3"
+[ -n "${OS_LOG_DEV:-}" ] && mkfs.ext4 -q -F -L "$LOG_LABEL" "$OS_LOG_DEV"
 
 # ---------------------------------------------------------- log volume -------
 LOG_DEV=""
@@ -386,6 +419,15 @@ NFSTMP=$(mktemp -d)
 mount "$P3" "$NFSTMP" && { mkdir -p "$NFSTMP/cproot" "$NFSTMP/dproot"; umount "$NFSTMP"; }
 rmdir "$NFSTMP" 2>/dev/null || true
 echo "-- fstab: LABEL=$NFS_LABEL -> $NFS_MNT (cproot/ + dproot/ created) --"
+
+# Log volume on the OS disks. Mounted by LABEL with nofail, same as the
+# others: a missing log volume must never stop the firewall booting.
+if [ -n "${OS_LOG_DEV:-}" ]; then
+	mkdir -p "$MNT$LOG_MNT"
+	grep -q "$LOG_MNT" "$MNT/etc/fstab" 2>/dev/null \
+		|| echo "LABEL=$LOG_LABEL  $LOG_MNT  ext4  defaults,noatime,nofail  0  2" >> "$MNT/etc/fstab"
+	echo "-- fstab: LABEL=$LOG_LABEL -> $LOG_MNT (on the OS mirror; no chassis log array present) --"
+fi
 
 echo "-- installing GRUB (main + recovery entries) --"
 KVER=$(ls "$MNT/boot"/vmlinuz-* | sed 's#.*/vmlinuz-##' | sort | tail -1)
