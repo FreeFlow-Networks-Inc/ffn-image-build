@@ -334,7 +334,19 @@ class Session:
         if handler is None:
             print(f"Unknown command: {cmd}. Type '?' for help.")
             return True
-        return handler(args) if handler(args) is not None else True
+        # Call the handler ONCE.
+        #
+        # This used to read:
+        #     return handler(args) if handler(args) is not None else True
+        # which evaluates handler(args) in the condition and AGAIN in the
+        # true-branch, so every handler that returns a value -- which is nearly
+        # all of them, they end `return True` -- ran twice. Harmless for a read
+        # like `show interfaces` beyond duplicated output, but not for anything
+        # that mutates state: a write would be issued twice, and a reset would
+        # reset twice. Found while adding `set bcm ...`, which mutates switch
+        # hardware, so it had to be fixed first.
+        rv = handler(args)
+        return True if rv is None else rv
 
     # ---- Operational commands ------------------------------------------
 
@@ -399,11 +411,13 @@ class Session:
             return self._show_users()
         if sub == "commit-lock":
             return self._show_commit_lock()
+        if sub == "bcm":
+            return self._show_bcm(rest)
         print(f"Unknown 'show' sub: {sub}")
         return True
 
     def _show_usage(self):
-        print("Usage: show <system|interfaces|routing|arp|sessions|engines|log|config|users|commit-lock>")
+        print("Usage: show <system|interfaces|routing|arp|sessions|engines|log|config|users|commit-lock|bcm>")
         return True
 
     def _show_system(self, args):
@@ -618,7 +632,7 @@ class Session:
 
     def _cmd_request(self, args):
         if not args:
-            print("Usage: request <restart|allow|reload|system shell> ...")
+            print("Usage: request <restart|allow|reload|bcm|system shell> ...")
             return True
         sub = args[0]
         if sub == "restart":
@@ -639,8 +653,136 @@ class Session:
                 print(f"Unknown reload target: {tgt}")
         elif sub == "system" and len(args) > 1 and args[1] == "shell":
             return self._cmd_request_shell()
+        elif sub == "bcm":
+            return self._request_bcm(args[1:])
         else:
             print(f"Unknown request: {sub}")
+        return True
+
+    # ---- BCM88375 switch -----------------------------------------------
+    #
+    # Reads live under `show bcm`, hardware actions under `request bcm` -- not
+    # `set bcm`. That is deliberate: `set` writes the candidate config and waits
+    # for a commit, whereas these take effect on the ASIC immediately and are
+    # NOT persisted (the shipped switch config disables every front-panel port,
+    # so a chip re-init loses them). Filing them under `set` would promise
+    # durability the platform does not yet provide.
+
+    def _bcm(self, path, method="GET", body=None):
+        """One place that talks to the manager's BCM proxy."""
+        return api(path, method=method, body=body, token=self.token)
+
+    @staticmethod
+    def _bcm_unavailable(r):
+        """Print the daemon's own explanation rather than a generic failure.
+
+        The interesting case is state=init: the chip takes ~150 s to come up and
+        the daemon says so, with an eta. Reporting that as an error would send
+        an operator hunting a fault that is just a boot in progress.
+        """
+        if r.get("state") == "init":
+            eta = r.get("eta_s")
+            print(f"BCM is still initialising"
+                  + (f" (about {eta}s left)" if eta is not None else "")
+                  + ". Chip init takes ~150s from cold; try again shortly.")
+            return True
+        print(f"BCM unavailable: {r.get('error', 'unknown error')}")
+        for k in ("detail", "hint"):
+            if r.get(k):
+                print(color(f"  {k}: {r[k]}", C.DIM))
+        return True
+
+    def _show_bcm(self, args):
+        sub = args[0] if args else "status"
+
+        if sub == "status":
+            r = self._bcm("/api/bcm/status")
+            if not r.get("ok"):
+                return self._bcm_unavailable(r)
+            print(f"  state      : {r.get('state')}")
+            print(f"  chip       : {r.get('chip')} rev {r.get('rev')} on {r.get('bus')}")
+            print(f"  session up : {r.get('uptime_s')}s"
+                  + (f" (init took {r['init_took_s']}s)" if r.get("init_took_s") else ""))
+            errs = r.get("init_errors") or []
+            if errs:
+                # A chip can reach its prompt with init only PARTLY done, so
+                # these are worth showing rather than hiding behind "ready".
+                print(color(f"  init warnings ({len(errs)}):", C.DIM))
+                for e in errs[:5]:
+                    print(color(f"    {e}", C.DIM))
+            return True
+
+        if sub in ("ports", "port"):
+            want_all = "all" in args
+            one = None
+            if sub == "port" and len(args) > 1 and args[1].isdigit():
+                one = int(args[1])
+            r = self._bcm("/api/bcm/ports")
+            if not r.get("ok"):
+                return self._bcm_unavailable(r)
+            rows = r.get("ports", [])
+            if one is not None:
+                rows = [p for p in rows if p["port"] == one]
+                if not rows:
+                    print(f"No such port: {one}")
+                    return True
+            elif not want_all:
+                # Default to the faceplate. The internal ports (the DP trunk,
+                # recycle, ILKN) are not user-configurable and listing them
+                # invites someone to disable the dataplane link by mistake.
+                rows = [p for p in rows if p["faceplate"]]
+            print(f"  {'port':<8} {'num':>4}  {'admin':<9} {'link':<6} {'speed':>8}")
+            for p in sorted(rows, key=lambda x: x["port"]):
+                spd = f"{p['speed_mb'] // 1000}G" if p.get("speed_mb") else "-"
+                print(f"  {p['name']:<8} {p['port']:>4}  "
+                      f"{'enabled' if p['enabled'] else 'disabled':<9} "
+                      f"{'up' if p['link'] else 'down':<6} {spd:>8}")
+            shown, total = len(rows), r.get("count", len(rows))
+            print(color(f"  {shown} of {total} ports"
+                        + ("" if want_all or one is not None
+                           else "  (front panel only; 'show bcm ports all' for every port)"),
+                        C.DIM))
+            return True
+
+        if sub == "leds":
+            r = self._bcm("/api/bcm/leds")
+            if not r.get("ok"):
+                return self._bcm_unavailable(r)
+            print(f"  LED processors: {'running' if r.get('enabled') else 'stopped'}"
+                  f"  (LEDUP0_CTRL={r.get('value')})")
+            if not r.get("enabled"):
+                print(color("  The switch init script programs and starts the LED"
+                            " processors; stopped means it did not get that far.",
+                            C.DIM))
+            return True
+
+        print("Usage: show bcm <status|ports [all]|port <n>|leds>")
+        return True
+
+    def _request_bcm(self, args):
+        if len(args) >= 3 and args[0] == "port" and args[1].isdigit():
+            port, action = int(args[1]), args[2]
+            if action in ("enable", "disable"):
+                r = self._bcm(f"/api/bcm/port/{port}/enable", method="POST",
+                              body={"enable": action == "enable"})
+                if not r.get("ok"):
+                    return self._bcm_unavailable(r)
+                print(f"port {port} {action}d")
+                print(color("  Immediate and NOT persisted: a chip re-init"
+                            " restores the shipped config.", C.DIM))
+                return True
+            if action == "loopback":
+                mode = args[3] if len(args) > 3 else "none"
+                r = self._bcm(f"/api/bcm/port/{port}/loopback", method="POST",
+                              body={"mode": mode})
+                if not r.get("ok"):
+                    return self._bcm_unavailable(r)
+                print(f"port {port} loopback = {mode}")
+                if mode in ("mac", "phy"):
+                    print(color("  Diagnostic loopback: this port now carries no"
+                                " external traffic until set back to none.", C.DIM))
+                return True
+        print("Usage: request bcm port <n> <enable|disable|loopback <none|mac|phy>>")
         return True
 
     def _cmd_request_shell(self):
