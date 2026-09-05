@@ -417,7 +417,7 @@ class Session:
         return True
 
     def _show_usage(self):
-        print("Usage: show <system|interfaces|routing|arp|sessions|engines|log|config|users|commit-lock|bcm>")
+        print("Usage: show <system[ interfaces|platform]|interfaces|routing|arp|sessions|engines|log|config|users|commit-lock|bcm>")
         return True
 
     def _show_system(self, args):
@@ -428,9 +428,11 @@ class Session:
         # the other.
         if args and args[0] in ("interfaces", "interface"):
             return self._show_system_interfaces(args[1:])
+        if args and args[0] in ("platform", "hardware", "spec"):
+            return self._show_system_platform(args[1:])
         s = api("/api/system/status", token=self.token)
         r = api("/api/system/resources", token=self.token)
-        print_kv([
+        rows = [
             ("Hostname", s.get("hostname")),
             ("Uptime", s.get("uptime_human")),
             ("Platform", f"{s.get('platform')} {s.get('kernel','')}"),
@@ -438,8 +440,57 @@ class Session:
             ("CPU Usage", f"{r['cpu']['usage_percent']}%"),
             ("Memory", f"{r['memory']['used_gb']}/{r['memory']['total_gb']} GB ({r['memory']['percent']}%)"),
             ("Disk", f"{r['disk']['used_gb']}/{r['disk']['total_gb']} GB ({r['disk']['percent']}%)"),
-            ("FPGA", f"v{s.get('fpga_version')}" if s.get("fpga_detected") else "not detected"),
+        ]
+        # Only mention the accelerator card where one could exist. Printing
+        # "FPGA: not detected" on a chassis that was never going to have one
+        # reports the absence of a part that does not fit as though it were a
+        # fault. `show system platform` has the full picture.
+        prof = (api("/api/system/platform", token=self.token) or {})
+        feats = prof.get("features") or {}
+        if (feats.get("fpga_card") or {}).get("applicable", True):
+            rows.append(("FPGA", f"v{s.get('fpga_version')}"
+                         if s.get("fpga_detected") else "not detected"))
+        if prof.get("hardware"):
+            rows.insert(2, ("Hardware", prof["hardware"]))
+            rows.insert(3, ("Datapath", prof.get("datapath", "")))
+        print_kv(rows)
+        return True
+
+    def _show_system_platform(self, args):
+        """What this appliance is, and which features apply to it.
+
+        The applicable/present split is the useful column here: a feature that
+        is not applicable is not a fault and not a to-do, it is simply not part
+        of this hardware. One that IS applicable and absent is the only kind
+        worth an operator's attention.
+        """
+        d = api("/api/system/platform", token=self.token) or {}
+        ch = d.get("chassis") or {}
+        print_kv([
+            ("Platform", d.get("platform") or "unknown"),
+            ("Hardware", d.get("hardware") or "unidentified chassis"),
+            ("Datapath", d.get("datapath") or "unknown"),
+            ("Chassis", (ch.get("family") or "") +
+                (f"  (models: {', '.join(ch.get('models') or [])})"
+                 if ch.get("models") else "")),
+            ("NPU", ch.get("npu") or "none"),
         ])
+        rows = []
+        for name, f in sorted((d.get("features") or {}).items()):
+            if not f.get("applicable"):
+                state = color("n/a", C.DIM)
+            elif f.get("present"):
+                state = color("present", C.G)
+            else:
+                state = color("MISSING", C.Y)
+            rows.append([name, state, (f.get("reason") or f.get("detail") or "")[:64]])
+        print()
+        print_table(["Feature", "State", "Note"], rows)
+        missing = [n for n, f in (d.get("features") or {}).items()
+                   if f.get("applicable") and not f.get("present")]
+        print(color("  n/a = not part of this hardware, not a fault."
+                    + (f"  {len(missing)} applicable feature(s) missing: "
+                       + ", ".join(sorted(missing)) if missing else ""), C.DIM))
         return True
 
     def _show_interfaces(self, args):
