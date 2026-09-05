@@ -443,37 +443,82 @@ class Session:
         return True
 
     def _show_interfaces(self, args):
-        """The firewall's DATA interfaces -- the BCM front-panel ports.
+        """The firewall's DATA interfaces -- the chassis faceplate ports.
 
         These are the interfaces traffic actually traverses. The MP's own NICs
         are device hardware, not firewall interfaces, and live under
         `show system interfaces`: showing them here invited an operator to
         configure a management NIC believing it was a data port.
 
-        `show interfaces all` includes the internal ports (the dataplane trunk,
-        recycle, ILKN), which are not front panel and are not user-configurable.
+        Named by CONNECTOR, because that is what an operator has in front of
+        them. ethernet1/1 is the first RJ45; the chip's own name for it (xe28)
+        is shown too, since that is what every switch-level tool and log line
+        says and it is not derivable from either the interface name or the
+        connector number.
+
+        `show interfaces all` adds the internal ports -- the dataplane trunk,
+        recycle, ILKN -- which are not on the front panel and are not
+        user-configurable.
         """
         want_all = "all" in args
+
+        # Preferred source: the faceplate map, which knows which connector each
+        # port is and what it is called. Falls back to the raw chip port list on
+        # a platform that has no faceplate map, where the diag name is genuinely
+        # the only name there is.
+        al = api("/api/interfaces/aliases", token=self.token) or {}
+        fp = al.get("faceplate") or []
+        if fp and not want_all:
+            rows = []
+            for p in fp:
+                pos = p["faceplate"]
+                rows.append([
+                    p["name"],
+                    pos if not pos.isdigit() else pos,
+                    p.get("media") or "-",
+                    f"{p['speed_gbps']}G" if p.get("speed_gbps") else "-",
+                    "enabled" if p.get("admin_enabled") else "disabled",
+                    # None is not False. An unreachable control plane means the
+                    # link state is UNKNOWN, and printing "down" for every port
+                    # on a healthy chassis because a daemon is restarting is a
+                    # confident wrong answer.
+                    "up" if p.get("link") else ("down" if p.get("live") else "?"),
+                    p.get("diag_name") or "-",
+                ])
+            print_table(["Interface", "Front", "Media", "Speed", "Admin", "Link",
+                         "Chip"], rows)
+            live = any(p.get("live") for p in fp)
+            note = f"  {len(rows)} faceplate port(s)"
+            if not live:
+                note += "  (link state unavailable: control plane not answering)"
+            else:
+                note += "  ('show interfaces all' for internal ports too)"
+            print(color(note, C.DIM))
+            return True
+
         r = self._bcm("/api/bcm/ports")
         if not r.get("ok"):
             return self._bcm_unavailable(r)
+        by_port = {p["bcm_port"]: p for p in fp}
         rows = []
         for p in sorted(r.get("ports", []), key=lambda x: x["port"]):
             if not want_all and not p.get("faceplate"):
                 continue
             spd = f"{p['speed_mb'] // 1000}G" if p.get("speed_mb") else "-"
+            known = by_port.get(p["port"])
             rows.append([
+                (known or {}).get("name") or "-",
                 p["name"],
                 p["port"],
                 "enabled" if p["enabled"] else "disabled",
                 "up" if p["link"] else "down",
                 spd,
             ])
-        print_table(["Name", "Port", "Admin", "Link", "Speed"], rows)
+        print_table(["Interface", "Chip", "Port", "Admin", "Link", "Speed"], rows)
         shown, total = len(rows), r.get("count", len(rows))
-        print(color(f"  {shown} of {total} ports"
-                    + ("" if want_all else "  (front panel; 'show interfaces all'"
-                                           " for internal ports too)"), C.DIM))
+        print(color(f"  {shown} of {total} chip ports"
+                    + ("  (internal ports have no faceplate connector, so no"
+                       " interface name)" if want_all else ""), C.DIM))
         return True
 
     def _show_system_interfaces(self, args):
