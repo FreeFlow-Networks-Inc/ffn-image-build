@@ -421,6 +421,13 @@ class Session:
         return True
 
     def _show_system(self, args):
+        # `show system interfaces` -- the MP's device NICs. They are deliberately
+        # NOT under `show interfaces`, which is the firewall's data path (the BCM
+        # front-panel ports). A management NIC and a data port are different
+        # kinds of thing and listing them together invites configuring one for
+        # the other.
+        if args and args[0] in ("interfaces", "interface"):
+            return self._show_system_interfaces(args[1:])
         s = api("/api/system/status", token=self.token)
         r = api("/api/system/resources", token=self.token)
         print_kv([
@@ -436,6 +443,41 @@ class Session:
         return True
 
     def _show_interfaces(self, args):
+        """The firewall's DATA interfaces -- the BCM front-panel ports.
+
+        These are the interfaces traffic actually traverses. The MP's own NICs
+        are device hardware, not firewall interfaces, and live under
+        `show system interfaces`: showing them here invited an operator to
+        configure a management NIC believing it was a data port.
+
+        `show interfaces all` includes the internal ports (the dataplane trunk,
+        recycle, ILKN), which are not front panel and are not user-configurable.
+        """
+        want_all = "all" in args
+        r = self._bcm("/api/bcm/ports")
+        if not r.get("ok"):
+            return self._bcm_unavailable(r)
+        rows = []
+        for p in sorted(r.get("ports", []), key=lambda x: x["port"]):
+            if not want_all and not p.get("faceplate"):
+                continue
+            spd = f"{p['speed_mb'] // 1000}G" if p.get("speed_mb") else "-"
+            rows.append([
+                p["name"],
+                p["port"],
+                "enabled" if p["enabled"] else "disabled",
+                "up" if p["link"] else "down",
+                spd,
+            ])
+        print_table(["Name", "Port", "Admin", "Link", "Speed"], rows)
+        shown, total = len(rows), r.get("count", len(rows))
+        print(color(f"  {shown} of {total} ports"
+                    + ("" if want_all else "  (front panel; 'show interfaces all'"
+                                           " for internal ports too)"), C.DIM))
+        return True
+
+    def _show_system_interfaces(self, args):
+        """The MP's own NICs -- device hardware, not firewall interfaces."""
         d = api("/api/system/interfaces", token=self.token)
         rows = []
         for i in d.get("interfaces", []):
@@ -450,6 +492,8 @@ class Session:
                 i.get("tx_packets", 0),
             ])
         print_table(["Name", "Type", "State", "Speed", "IP", "MAC", "RX Pkts", "TX Pkts"], rows)
+        print(color("  Management-plane device interfaces. Data interfaces are"
+                    " 'show interfaces'.", C.DIM))
         return True
 
     def _show_routing(self, args):
