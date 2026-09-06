@@ -159,6 +159,14 @@ log "first-boot + hw-tune + selftest + FIPS + recovery services"
 install -m755 /payload/ffn-firstboot.sh /usr/local/sbin/ffn-firstboot.sh
 install -m755 /payload/ffn-hwtune.sh     /usr/local/sbin/ffn-hwtune.sh
 install -m755 /payload/ffn-selftest.sh    /usr/local/sbin/ffn-selftest.sh
+# The manager's launcher and the bind resolver it calls. BOTH are installed here
+# rather than left to /opt/ffn-ngfw-v2, because that directory is unpacked from
+# opt-ffn-ngfw-v2.tgz which the build HARVESTS FROM A LIVE BOX -- so an image
+# built from a box predating these files would get a unit whose ExecStart points
+# at nothing, and no management server at all. The wrapper prefers the /opt copy
+# when one exists, so deploying a newer manager still wins.
+install -m755 /payload/ffn-manager-start.sh /usr/local/sbin/ffn-manager-start.sh
+install -m755 /payload/ffn_mgmt_bind.py     /usr/local/sbin/ffn_mgmt_bind.py
 cp -a /payload/ffn-firstboot.service /etc/systemd/system/
 cp -a /payload/ffn-selftest.service  /etc/systemd/system/
 # FIPS-CC power-on self-test (runs when /etc/ffn-ngfw/fips-cc.mode exists) + dataplane gating

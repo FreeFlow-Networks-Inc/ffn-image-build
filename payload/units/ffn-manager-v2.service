@@ -6,8 +6,26 @@ Type=simple
 WorkingDirectory=/opt/ffn-ngfw-v2
 Environment=FFN_DB_PATH=/var/lib/ffn-ngfw/config-v2.db
 Environment=FFN_CONFIG_DIR=/var/lib/ffn-ngfw/config-v2
-Environment=FFN_MGMT_IFACE=eno1np0
-ExecStart=/opt/ffn-ngfw-v2/venv/bin/uvicorn ffn_manager:app --host 0.0.0.0 --port 8443 --app-dir /opt/ffn-ngfw-v2 --loop asyncio --timeout-keep-alive 30
+# NO Environment=FFN_MGMT_IFACE HERE, DELIBERATELY.
+#
+# This line used to read FFN_MGMT_IFACE=eno1np0, which is the BUILD HOST's NIC
+# harvested into the image. On the 5220 that name does not exist:
+#
+#     # ip -br link show eno1np0
+#     Device "eno1np0" does not exist.
+#     # cat /etc/ffn-ngfw/mgmt.conf
+#     MGMT_IFACE=enp15s0
+#
+# ffn_config_bridge.py's _mgmt_ifaces() documents the identical leak and was
+# fixed for it; this unit was not. Anything binding to $FFN_MGMT_IFACE at face
+# value would have bound to nothing and taken management offline.
+#
+# ffn_mgmt_bind.py resolves the interface from /etc/ffn-ngfw/mgmt.conf, which
+# provision.sh writes on the real chassis from what it actually found. It still
+# accepts FFN_MGMT_IFACE as a hint, but only after checking it against
+# /sys/class/net -- so setting it here is unnecessary and setting it WRONG is
+# how this broke. Override with FFN_MGR_HOST if a specific address is wanted.
+ExecStart=/usr/local/sbin/ffn-manager-start.sh
 Restart=on-failure
 RestartSec=3
 [Install]
