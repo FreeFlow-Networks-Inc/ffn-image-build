@@ -10,7 +10,13 @@ echo "=== FFN SELFTEST $(date -u +%FT%TZ) ==="
 code=000
 for i in $(seq 1 60); do
   code=$(curl -k -s -o /dev/null -w '%{http_code}' --max-time 3 https://127.0.0.1:8443/api/system/status || echo 000)
-  [ "$code" = "200" ] && break
+  # 401/403 count as up. An authenticated API answering "no" still proves the
+  # management plane loaded, which is all this loop is testing -- and it is the
+  # same judgement ffn_updated.py already makes:
+  #     api = r.status in (200, 401, 403)   # answering at all is the point
+  # Without this, putting /api/system/status behind auth would make a healthy
+  # appliance fail its own boot selftest after 120 seconds of retries.
+  case "$code" in 200|401|403) break ;; esac
   sleep 2
 done
 
