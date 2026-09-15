@@ -41,3 +41,7 @@ __pycache__/
 # Compiled MIPS64 outputs whose source sits beside them (dpagent/*.c).
 dpagent/ffn_dpagent
 dpagent/ffn_dpagent2
+
+# Superseded draft that install-to-disk.sh was built from. Kept off the repo so
+# nobody runs the wrong file; its reasoning is carried in install-to-disk.sh.
+install-to-disk.sh.raid1-proposed

@@ -417,7 +417,7 @@ class Session:
         return True
 
     def _show_usage(self):
-        print("Usage: show <system|interfaces|routing|arp|sessions|engines|log|config|users|commit-lock|bcm>")
+        print("Usage: show <system[ interfaces|platform]|interfaces|routing|arp|sessions|engines|log|config|users|commit-lock|bcm>")
         return True
 
     def _show_system(self, args):
@@ -428,9 +428,11 @@ class Session:
         # the other.
         if args and args[0] in ("interfaces", "interface"):
             return self._show_system_interfaces(args[1:])
+        if args and args[0] in ("platform", "hardware", "spec"):
+            return self._show_system_platform(args[1:])
         s = api("/api/system/status", token=self.token)
         r = api("/api/system/resources", token=self.token)
-        print_kv([
+        rows = [
             ("Hostname", s.get("hostname")),
             ("Uptime", s.get("uptime_human")),
             ("Platform", f"{s.get('platform')} {s.get('kernel','')}"),
@@ -438,42 +440,136 @@ class Session:
             ("CPU Usage", f"{r['cpu']['usage_percent']}%"),
             ("Memory", f"{r['memory']['used_gb']}/{r['memory']['total_gb']} GB ({r['memory']['percent']}%)"),
             ("Disk", f"{r['disk']['used_gb']}/{r['disk']['total_gb']} GB ({r['disk']['percent']}%)"),
-            ("FPGA", f"v{s.get('fpga_version')}" if s.get("fpga_detected") else "not detected"),
+        ]
+        # Only mention the accelerator card where one could exist. Printing
+        # "FPGA: not detected" on a chassis that was never going to have one
+        # reports the absence of a part that does not fit as though it were a
+        # fault. `show system platform` has the full picture.
+        prof = (api("/api/system/platform", token=self.token) or {})
+        feats = prof.get("features") or {}
+        if (feats.get("fpga_card") or {}).get("applicable", True):
+            rows.append(("FPGA", f"v{s.get('fpga_version')}"
+                         if s.get("fpga_detected") else "not detected"))
+        if prof.get("hardware"):
+            rows.insert(2, ("Hardware", prof["hardware"]))
+            rows.insert(3, ("Datapath", prof.get("datapath", "")))
+        print_kv(rows)
+        return True
+
+    def _show_system_platform(self, args):
+        """What this appliance is, and which features apply to it.
+
+        The applicable/present split is the useful column here: a feature that
+        is not applicable is not a fault and not a to-do, it is simply not part
+        of this hardware. One that IS applicable and absent is the only kind
+        worth an operator's attention.
+        """
+        d = api("/api/system/platform", token=self.token) or {}
+        ch = d.get("chassis") or {}
+        print_kv([
+            ("Platform", d.get("platform") or "unknown"),
+            ("Hardware", d.get("hardware") or "unidentified chassis"),
+            ("Datapath", d.get("datapath") or "unknown"),
+            ("Chassis", (ch.get("family") or "") +
+                (f"  (models: {', '.join(ch.get('models') or [])})"
+                 if ch.get("models") else "")),
+            ("NPU", ch.get("npu") or "none"),
         ])
+        rows = []
+        for name, f in sorted((d.get("features") or {}).items()):
+            if not f.get("applicable"):
+                state = color("n/a", C.DIM)
+            elif f.get("present"):
+                state = color("present", C.G)
+            else:
+                state = color("MISSING", C.Y)
+            rows.append([name, state, (f.get("reason") or f.get("detail") or "")[:64]])
+        print()
+        print_table(["Feature", "State", "Note"], rows)
+        missing = [n for n, f in (d.get("features") or {}).items()
+                   if f.get("applicable") and not f.get("present")]
+        print(color("  n/a = not part of this hardware, not a fault."
+                    + (f"  {len(missing)} applicable feature(s) missing: "
+                       + ", ".join(sorted(missing)) if missing else ""), C.DIM))
         return True
 
     def _show_interfaces(self, args):
-        """The firewall's DATA interfaces -- the BCM front-panel ports.
+        """The firewall's DATA interfaces -- the chassis faceplate ports.
 
         These are the interfaces traffic actually traverses. The MP's own NICs
         are device hardware, not firewall interfaces, and live under
         `show system interfaces`: showing them here invited an operator to
         configure a management NIC believing it was a data port.
 
-        `show interfaces all` includes the internal ports (the dataplane trunk,
-        recycle, ILKN), which are not front panel and are not user-configurable.
+        Named by CONNECTOR, because that is what an operator has in front of
+        them. ethernet1/1 is the first RJ45; the chip's own name for it (xe28)
+        is shown too, since that is what every switch-level tool and log line
+        says and it is not derivable from either the interface name or the
+        connector number.
+
+        `show interfaces all` adds the internal ports -- the dataplane trunk,
+        recycle, ILKN -- which are not on the front panel and are not
+        user-configurable.
         """
         want_all = "all" in args
+
+        # Preferred source: the faceplate map, which knows which connector each
+        # port is and what it is called. Falls back to the raw chip port list on
+        # a platform that has no faceplate map, where the diag name is genuinely
+        # the only name there is.
+        al = api("/api/interfaces/aliases", token=self.token) or {}
+        fp = al.get("faceplate") or []
+        if fp and not want_all:
+            rows = []
+            for p in fp:
+                pos = p["faceplate"]
+                rows.append([
+                    p["name"],
+                    pos if not pos.isdigit() else pos,
+                    p.get("media") or "-",
+                    f"{p['speed_gbps']}G" if p.get("speed_gbps") else "-",
+                    "enabled" if p.get("admin_enabled") else "disabled",
+                    # None is not False. An unreachable control plane means the
+                    # link state is UNKNOWN, and printing "down" for every port
+                    # on a healthy chassis because a daemon is restarting is a
+                    # confident wrong answer.
+                    "up" if p.get("link") else ("down" if p.get("live") else "?"),
+                    p.get("diag_name") or "-",
+                ])
+            print_table(["Interface", "Front", "Media", "Speed", "Admin", "Link",
+                         "Chip"], rows)
+            live = any(p.get("live") for p in fp)
+            note = f"  {len(rows)} faceplate port(s)"
+            if not live:
+                note += "  (link state unavailable: control plane not answering)"
+            else:
+                note += "  ('show interfaces all' for internal ports too)"
+            print(color(note, C.DIM))
+            return True
+
         r = self._bcm("/api/bcm/ports")
         if not r.get("ok"):
             return self._bcm_unavailable(r)
+        by_port = {p["bcm_port"]: p for p in fp}
         rows = []
         for p in sorted(r.get("ports", []), key=lambda x: x["port"]):
             if not want_all and not p.get("faceplate"):
                 continue
             spd = f"{p['speed_mb'] // 1000}G" if p.get("speed_mb") else "-"
+            known = by_port.get(p["port"])
             rows.append([
+                (known or {}).get("name") or "-",
                 p["name"],
                 p["port"],
                 "enabled" if p["enabled"] else "disabled",
                 "up" if p["link"] else "down",
                 spd,
             ])
-        print_table(["Name", "Port", "Admin", "Link", "Speed"], rows)
+        print_table(["Interface", "Chip", "Port", "Admin", "Link", "Speed"], rows)
         shown, total = len(rows), r.get("count", len(rows))
-        print(color(f"  {shown} of {total} ports"
-                    + ("" if want_all else "  (front panel; 'show interfaces all'"
-                                           " for internal ports too)"), C.DIM))
+        print(color(f"  {shown} of {total} chip ports"
+                    + ("  (internal ports have no faceplate connector, so no"
+                       " interface name)" if want_all else ""), C.DIM))
         return True
 
     def _show_system_interfaces(self, args):

@@ -49,11 +49,17 @@ die(){ echo "ERROR: $*" >&2; exit 1; }
 
 # Standalone installer: it does NOT source config.sh, so give the console baud
 # its own default. Appliance chassis (PA-3200/PA-5200) run 9600:
-#     FFN_SERIAL_BAUD=9600 sudo -E ./install-to-disk.sh
+#     sudo FFN_SERIAL_BAUD=9600 ./install-to-disk.sh
+#   NOT `sudo -E`: many sudo builds are compiled without SETENV and print
+#   "preserving the entire environment is not supported, '-E' is ignored",
+#   so the variable silently never reaches the script. With FFN_ASSUME_YES
+#   that means it drops into the interactive prompts instead and dies on a
+#   closed stdin. Pass the assignments as sudo ARGUMENTS, as above.
 FFN_SERIAL_BAUD="${FFN_SERIAL_BAUD:-115200}"
 FFN_ASSUME_YES="${FFN_ASSUME_YES:-0}"
 
 LOG_MD=/dev/md9          # matches the existing appliance convention
+OS_LOG_DEV=""            # set when logs live on the OS disks rather than their own
 LOG_MNT=/opt/ffn-logs
 LOG_LABEL=ffn-logs
 
@@ -222,28 +228,110 @@ fi
 # log mirror assembled would tear that down too -- not something an installer
 # aimed at specific disks has any business doing.
 stop_arrays_on(){
-	local d base md
+	# Stopping an array is not enough on its own: udev's INCREMENTAL ASSEMBLY
+	# re-creates it from the surviving superblocks within moments, so a single
+	# pass races udev and partitioning then dies with
+	#   wipefs: error: /dev/sdX: probing initialization failed: Device or resource busy
+	# Observed on a re-image of disks that already carried our own arrays.
+	# So: stop, then zero the members' superblocks (leaving udev nothing to
+	# assemble FROM), then re-check, up to a few rounds. Zeroing is safe here
+	# because every caller passes disks the operator has already confirmed for
+	# erasure -- this runs after the ERASE prompt.
+	local d base md p round left mdname mp
+	for round in 1 2 3 4 5; do
+		left=0
+		for d in "$@"; do
+			base=$(basename "$d")
+			for md in /sys/block/md*; do
+				[ -d "$md" ] || continue
+				if ls "$md"/slaves 2>/dev/null | grep -q "^${base}[0-9p]*$"; then
+					mdname=$(basename "$md")
+					# An array with a MOUNTED filesystem will not stop, and a
+					# previous failed run leaves its mktemp mount behind -- which
+					# presents as an unstoppable array for no visible reason.
+					# Release it first; these disks are already confirmed for erasure.
+					for mp in $(awk -v dv="/dev/$mdname" '$1==dv{print $2}' /proc/self/mounts); do
+						echo "-- releasing $mp (mounted from /dev/$mdname) --"
+						umount "$mp" 2>/dev/null || umount -l "$mp" 2>/dev/null || true
+					done
+					echo "-- stopping /dev/$mdname (member on $d) --"
+					mdadm --stop "/dev/$mdname" >/dev/null 2>&1 || true
+					left=1
+				fi
+			done
+		done
+		[ "$left" = 0 ] && return 0
+		for d in "$@"; do
+			for p in "$d"[0-9]* "${d}p"[0-9]*; do
+				[ -b "$p" ] && { mdadm --zero-superblock "$p" >/dev/null 2>&1 || true; }
+			done
+		done
+		sleep 1
+	done
+	# Last resort: say so rather than let partitioning fail with a confusing
+	# "resource busy" several steps later.
 	for d in "$@"; do
 		base=$(basename "$d")
 		for md in /sys/block/md*; do
 			[ -d "$md" ] || continue
-			if ls "$md"/slaves 2>/dev/null | grep -q "^${base}[0-9p]*$"; then
-				echo "-- stopping /dev/$(basename "$md") (member on $d) --"
-				mdadm --stop "/dev/$(basename "$md")" >/dev/null 2>&1 || true
-			fi
+			ls "$md"/slaves 2>/dev/null | grep -q "^${base}[0-9p]*$" 				&& die "cannot release /dev/$(basename "$md") from $d; stop it by hand and re-run"
 		done
 	done
 }
 
-part_os(){   # $1 = disk, $2 = end of partition 1, $3 = end of partition 2
+# Partition numbers, named once so the shift from the old msdos layout cannot
+# be got wrong in one place and not another. p1 is the BIOS boot partition.
+OS_P_BIOS=1
+OS_P_ROOT=2
+OS_P_RECOVERY=3
+OS_P_NFS=4
+OS_P_LOGS=5
+
+# Fixed sizes, not proportions. Root matches the image build's
+# IMG_P1_END so a disk installed here and one installed from the image
+# agree; recovery is a maintenance environment and 8 GiB is ample; the
+# remainder becomes mirrored NFS space for the OCTEON planes rather than
+# being absorbed by recovery.
+OS_ROOT_END_MIB=81920      # 80 GiB
+OS_RECOVERY_END_MIB=90112  # +8 GiB
+# NFS gets a fixed 32 GiB rather than the remainder. The planes' roots are
+# ~80 MB trees, so 32 GiB is room to install into both many times over, and
+# log space is the scarcer resource once the chassis 2 TB log pair is absent.
+OS_NFS_END_MIB=122880      # +32 GiB
+NFS_MNT=/opt/ffn-nfs
+NFS_LABEL=ffn-nfs
+
+part_os(){   # $1 = disk, $2 = root end, $3 = recovery end, $4 = nfs end, $5 = logs end ("" = none)
 	wipefs -a "$1"
-	parted -s "$1" mklabel msdos
-	parted -s "$1" mkpart primary ext4 1MiB "$2"
+	# GPT, not msdos. On a GPT disk there is no post-MBR gap for core.img, so
+	# BIOS-mode GRUB needs a 1 MiB ef02 partition or grub-install --target=i386-pc
+	# fails. It gets NO filesystem: GRUB writes raw bytes there, and an mkfs on it
+	# breaks the boot.
+	#
+	# It is also deliberately NOT a RAID member. GRUB writes it per disk, so each
+	# disk carries its own copy and the box still boots with either one pulled --
+	# which is the whole reason for the mirror. Inside the array, core.img would
+	# have to be read through an md that is not assembled yet.
+	parted -s "$1" mklabel gpt
+	parted -s "$1" mkpart bios_grub 1MiB 2MiB
+	parted -s "$1" set $OS_P_BIOS bios_grub on
+	parted -s "$1" mkpart primary ext4 2MiB "$2"
 	parted -s "$1" mkpart primary ext4 "$2" "$3"
-	parted -s "$1" set 1 boot on
+	# The remainder: mirrored NFS space for the OCTEON control and data plane
+	# root filesystems. Their own initramfs is RAM-backed, so anything they
+	# install has to live on the host's disk to survive a reboot.
+	parted -s "$1" mkpart primary ext4 "$3" "$4"
+	# Logs, when no dedicated log disks were chosen. Without the chassis 2 TB
+	# pair there is no array for ffn-logvol.sh to discover, and logs would
+	# otherwise fill the root filesystem.
+	if [ -n "${5:-}" ]; then
+		parted -s "$1" mkpart primary ext4 "$4" "$5"
+	fi
 	if [ "$OS_RAID" = 1 ]; then
-		parted -s "$1" set 1 raid on
-		parted -s "$1" set 2 raid on
+		parted -s "$1" set $OS_P_ROOT raid on
+		parted -s "$1" set $OS_P_RECOVERY raid on
+		parted -s "$1" set $OS_P_NFS raid on
+		[ -n "${5:-}" ] && parted -s "$1" set $OS_P_LOGS raid on
 	fi
 	partprobe "$1"; sleep 2
 }
@@ -252,7 +340,15 @@ part_os(){   # $1 = disk, $2 = end of partition 1, $3 = end of partition 2
 stop_arrays_on "${OS_DISKS[@]}"
 if [ "$OS_RAID" = 1 ]; then
 	for d in "${OS_DISKS[@]}"; do
-		for n in 1 2; do mdadm --zero-superblock "$(pname "$d" "$n")" >/dev/null 2>&1 || true; done
+		# Zero EVERY member we are about to build on, and the whole disk too.
+		# This used to clear only p2 and p3, so a stale superblock on p4, p5 or
+		# the raw device survived an install and could be auto-assembled later
+		# as a foreign array claiming space we had just partitioned. Reclaimed
+		# SSDs arrive carrying someone else's metadata; assume nothing.
+		for n in $OS_P_ROOT $OS_P_RECOVERY $OS_P_NFS $OS_P_LOGS; do
+			mdadm --zero-superblock "$(pname "$d" "$n")" >/dev/null 2>&1 || true
+		done
+		mdadm --zero-superblock "$d" >/dev/null 2>&1 || true
 	done
 	# Identical explicit sizes derived from the SMALLER disk. The two SSDs in a
 	# reclaimed chassis are usually different models and differ by a few MB;
@@ -266,26 +362,56 @@ if [ "$OS_RAID" = 1 ]; then
 		[ "$s" -lt "$SMALL" ] && SMALL=$s
 	done
 	USABLE_MIB=$(( SMALL / 1048576 - 64 ))
-	[ "$USABLE_MIB" -gt 12288 ] || die "OS disks too small: ${USABLE_MIB}MiB usable"
-	echo "-- partitioning ${OS_DISKS[*]} (MBR, RAID members; ${USABLE_MIB}MiB usable) --"
-	for d in "${OS_DISKS[@]}"; do part_os "$d" "9216MiB" "${USABLE_MIB}MiB"; done
+	# Need root + recovery + something worth having for the planes.
+	[ "$USABLE_MIB" -gt $(( OS_RECOVERY_END_MIB + 4096 )) ] \
+		|| die "OS disks too small: ${USABLE_MIB}MiB usable, need > $(( OS_RECOVERY_END_MIB + 4096 ))MiB"
+	echo "-- partitioning ${OS_DISKS[*]} (GPT, RAID members; ${USABLE_MIB}MiB usable) --"
+	# Only carve an on-disk log volume when no dedicated log disks were chosen,
+	# so nothing ever competes for the ffn-logs label.
+	if [ "${#LOG_DISKS[@]}" -eq 0 ]; then
+		OS_LOG_ARG="${USABLE_MIB}MiB"; NFS_END="${OS_NFS_END_MIB}MiB"
+		echo "   root ${OS_ROOT_END_MIB}MiB / recovery $(( OS_RECOVERY_END_MIB - OS_ROOT_END_MIB ))MiB / nfs $(( OS_NFS_END_MIB - OS_RECOVERY_END_MIB ))MiB / logs $(( USABLE_MIB - OS_NFS_END_MIB ))MiB"
+	else
+		OS_LOG_ARG=""; NFS_END="${USABLE_MIB}MiB"
+		echo "   root ${OS_ROOT_END_MIB}MiB / recovery $(( OS_RECOVERY_END_MIB - OS_ROOT_END_MIB ))MiB / nfs $(( USABLE_MIB - OS_RECOVERY_END_MIB ))MiB (logs on dedicated disks)"
+	fi
+	for d in "${OS_DISKS[@]}"; do
+		part_os "$d" "${OS_ROOT_END_MIB}MiB" "${OS_RECOVERY_END_MIB}MiB" "$NFS_END" "$OS_LOG_ARG"
+	done
 	echo "-- creating OS mirrors (metadata 1.0) --"
 	mdadm --create --run --verbose /dev/md0 --level=1 --raid-devices=2 \
 	      --metadata=1.0 --homehost=ffn --name=ffn-root \
-	      "$(pname "${OS_DISKS[0]}" 1)" "$(pname "${OS_DISKS[1]}" 1)"
+	      "$(pname "${OS_DISKS[0]}" $OS_P_ROOT)" "$(pname "${OS_DISKS[1]}" $OS_P_ROOT)"
 	mdadm --create --run --verbose /dev/md1 --level=1 --raid-devices=2 \
 	      --metadata=1.0 --homehost=ffn --name=ffn-recovery \
-	      "$(pname "${OS_DISKS[0]}" 2)" "$(pname "${OS_DISKS[1]}" 2)"
-	P1=/dev/md0; P2=/dev/md1
+	      "$(pname "${OS_DISKS[0]}" $OS_P_RECOVERY)" "$(pname "${OS_DISKS[1]}" $OS_P_RECOVERY)"
+	mdadm --create --run --verbose /dev/md2 --level=1 --raid-devices=2 \
+	      --metadata=1.0 --homehost=ffn --name=$NFS_LABEL \
+	      "$(pname "${OS_DISKS[0]}" $OS_P_NFS)" "$(pname "${OS_DISKS[1]}" $OS_P_NFS)"
+	if [ -n "$OS_LOG_ARG" ]; then
+		mdadm --create --run --verbose /dev/md3 --level=1 --raid-devices=2 \
+		      --metadata=1.0 --homehost=ffn --name=$LOG_LABEL \
+		      "$(pname "${OS_DISKS[0]}" $OS_P_LOGS)" "$(pname "${OS_DISKS[1]}" $OS_P_LOGS)"
+		OS_LOG_DEV=/dev/md3
+	fi
+	P1=/dev/md0; P2=/dev/md1; P3=/dev/md2
 else
-	echo "-- partitioning ${OS_DISKS[0]} (MBR: main root + recovery) --"
-	part_os "${OS_DISKS[0]}" 9GiB 100%
-	P1=$(pname "${OS_DISKS[0]}" 1)
-	P2=$(pname "${OS_DISKS[0]}" 2)
+	echo "-- partitioning ${OS_DISKS[0]} (GPT: bios_grub + root + recovery + nfs) --"
+	if [ "${#LOG_DISKS[@]}" -eq 0 ]; then
+		part_os "${OS_DISKS[0]}" "${OS_ROOT_END_MIB}MiB" "${OS_RECOVERY_END_MIB}MiB" "${OS_NFS_END_MIB}MiB" 100%
+		OS_LOG_DEV=$(pname "${OS_DISKS[0]}" $OS_P_LOGS)
+	else
+		part_os "${OS_DISKS[0]}" "${OS_ROOT_END_MIB}MiB" "${OS_RECOVERY_END_MIB}MiB" 100% ""
+	fi
+	P1=$(pname "${OS_DISKS[0]}" $OS_P_ROOT)
+	P2=$(pname "${OS_DISKS[0]}" $OS_P_RECOVERY)
+	P3=$(pname "${OS_DISKS[0]}" $OS_P_NFS)
 fi
 
 mkfs.ext4 -q -F -L ffn-root     "$P1"
 mkfs.ext4 -q -F -L ffn-recovery "$P2"
+mkfs.ext4 -q -F -L "$NFS_LABEL"  "$P3"
+[ -n "${OS_LOG_DEV:-}" ] && mkfs.ext4 -q -F -L "$LOG_LABEL" "$OS_LOG_DEV"
 
 # ---------------------------------------------------------- log volume -------
 LOG_DEV=""
@@ -333,6 +459,27 @@ if [ -n "$LOG_DEV" ]; then
 	echo "-- fstab: LABEL=$LOG_LABEL -> $LOG_MNT (nofail, so a missing log volume never blocks boot) --"
 fi
 
+# NFS space for the OCTEON planes. Mounted by LABEL with nofail: an absent
+# volume must never stop the firewall booting, the same reasoning as the log
+# volume. cproot/ and dproot/ are created now so the export config and
+# ffn-nfsroot.sh have somewhere to point on first boot.
+mkdir -p "$MNT$NFS_MNT"
+grep -q "$NFS_MNT" "$MNT/etc/fstab" 2>/dev/null \
+	|| echo "LABEL=$NFS_LABEL  $NFS_MNT  ext4  defaults,noatime,nofail  0  2" >> "$MNT/etc/fstab"
+NFSTMP=$(mktemp -d)
+mount "$P3" "$NFSTMP" && { mkdir -p "$NFSTMP/cproot" "$NFSTMP/dproot"; umount "$NFSTMP"; }
+rmdir "$NFSTMP" 2>/dev/null || true
+echo "-- fstab: LABEL=$NFS_LABEL -> $NFS_MNT (cproot/ + dproot/ created) --"
+
+# Log volume on the OS disks. Mounted by LABEL with nofail, same as the
+# others: a missing log volume must never stop the firewall booting.
+if [ -n "${OS_LOG_DEV:-}" ]; then
+	mkdir -p "$MNT$LOG_MNT"
+	grep -q "$LOG_MNT" "$MNT/etc/fstab" 2>/dev/null \
+		|| echo "LABEL=$LOG_LABEL  $LOG_MNT  ext4  defaults,noatime,nofail  0  2" >> "$MNT/etc/fstab"
+	echo "-- fstab: LABEL=$LOG_LABEL -> $LOG_MNT (on the OS mirror; no chassis log array present) --"
+fi
+
 echo "-- installing GRUB (main + recovery entries) --"
 KVER=$(ls "$MNT/boot"/vmlinuz-* | sed 's#.*/vmlinuz-##' | sort | tail -1)
 # Locate recovery by LABEL rather than a hardcoded (hd0,msdos2): under RAID the
@@ -377,12 +524,20 @@ fi
 if [ "$OS_RAID" = 1 ]; then
 	chroot "$MNT" sh -c 'command -v update-initramfs >/dev/null' \
 		|| die "target image has no update-initramfs; cannot build a RAID-capable initrd"
+	# A degraded array is the exact case a mirror exists for, and Ubuntu's
+	# initramfs REFUSES to start one unless told to. Without this a single
+	# failed disk drops the appliance to an (initramfs) prompt instead of
+	# booting, which defeats the entire point of mirroring root. Observed
+	# twice on real hardware, both times with perfectly valid metadata.
+	mkdir -p "$MNT/etc/initramfs-tools/conf.d"
+	echo "BOOT_DEGRADED=true" > "$MNT/etc/initramfs-tools/conf.d/mdadm"
+	echo "-- BOOT_DEGRADED=true (boots on one leg rather than halting) --"
 	chroot "$MNT" update-initramfs -u -k all
 	# core.img must read a 1.x superblock member before the initrd exists, and
 	# GRUB goes on BOTH disks so the box still boots with either one pulled.
 	# That is the entire point of the mirror.
 	for d in "${OS_DISKS[@]}"; do
-		grub-install --target=i386-pc --modules="mdraid1x part_msdos ext2" \
+		grub-install --target=i386-pc --modules="mdraid1x part_gpt ext2" \
 		             --boot-directory="$MNT/boot" "$d"
 	done
 else
@@ -390,8 +545,86 @@ else
 fi
 
 chroot "$MNT" grub-mkconfig -o /boot/grub/grub.cfg
-umount -R "$MNT/dev" 2>/dev/null || true; umount "$MNT/sys" "$MNT/proc" 2>/dev/null || true
-umount "$MNT" "$MNT2"; rmdir "$MNT" "$MNT2"
+# Cleanup must never fail the install. Everything above has already been
+# written and synced; a busy mountpoint here is a transient reference held by a
+# helper that update-initramfs or grub-mkconfig spawned, not a problem with the
+# result. Previously `umount "$MNT" "$MNT2"` had no `|| true`, so set -e turned
+# a tidy-up hiccup into exit 32 on a completed install -- which reads as "the
+# install failed" and invites redoing it or discarding a good disk.
+unmount_tree(){   # $1 = mountpoint to release, deepest first
+	local mp="$1" i sub
+	[ -n "$mp" ] || return 0
+	# Deepest-first, so /dev/pts and /dev/shm go before /dev, and /dev before $MNT.
+	for sub in $(mount | awk -v m="$mp" '$3 ~ "^"m {print $3}' | sort -r); do
+		for i in 1 2 3; do
+			umount "$sub" 2>/dev/null && break
+			sleep 1
+		done
+		# Still held: detach lazily. The filesystem goes once the last
+		# descriptor closes, which is fine -- our writes are already done.
+		mountpoint -q "$sub" && umount -l "$sub" 2>/dev/null
+	done
+	return 0
+}
+sync
+unmount_tree "$MNT"
+unmount_tree "$MNT2"
+rmdir "$MNT" "$MNT2" 2>/dev/null || true
+
+# ------------------------------------------------ verify the arrays ----------
+# Declaring success without this is how a box that cannot assemble its own
+# root reaches a rack. Stop every array we built and re-assemble it from the
+# on-disk metadata ALONE -- exactly what the initramfs must do at boot, with
+# none of our mdadm.conf in play yet.
+if [ "$OS_RAID" = 1 ]; then
+	echo
+	echo "-- verifying the arrays cold-assemble from on-disk metadata --"
+	sync
+	# Check IDENTITY, never device paths. An array reassembled by scan comes back
+	# under whatever minor is free -- md0 becomes md124, md1 becomes md125 and so
+	# on -- which is the same "md9 -> md127" renumbering noted further up. A
+	# path-based check reports a perfectly healthy mirror as a failure.
+	VERIFY_UUIDS=$(mdadm --detail --scan 2>/dev/null | sed -n 's/.*UUID=\([^ ]*\).*/\1/p' | sort -u)
+	[ -n "$VERIFY_UUIDS" ] || die "no arrays to verify, yet OS_RAID=1"
+	for m in /dev/md*; do
+		[ -b "$m" ] && { mdadm --stop "$m" >/dev/null 2>&1 || true; }
+	done
+	# --run so a legitimately degraded array still counts as assembled.
+	mdadm --assemble --scan --run >/dev/null 2>&1 || true
+	sleep 2
+	BACK=$(mdadm --detail --scan 2>/dev/null | sed -n 's/.*UUID=\([^ ]*\).*/\1/p' | sort -u)
+	VERIFY_FAIL=0
+	for u in $VERIFY_UUIDS; do
+		if echo "$BACK" | grep -qx "$u"; then
+			echo "   OK   array $u re-assembled"
+		else
+			echo "   FAIL array $u did NOT re-assemble from its own metadata"
+			VERIFY_FAIL=1
+		fi
+	done
+	# The labels are what fstab and the initramfs actually search for, so prove
+	# those resolve too -- an assembled array with an unreadable filesystem would
+	# still strand the box.
+	for l in ffn-root ffn-recovery "$NFS_LABEL"; do
+		d=$(blkid -L "$l" 2>/dev/null)
+		case "$d" in
+			/dev/md*) echo "   OK   LABEL=$l -> $d" ;;
+			*)        echo "   FAIL LABEL=$l did not resolve to an md device (got: ${d:-nothing})"
+			          VERIFY_FAIL=1 ;;
+		esac
+	done
+	if [ "$VERIFY_FAIL" = 1 ]; then
+		echo
+		echo "REFUSING to report success: an array or label cannot be recovered from"
+		echo "the metadata now on disk, so this box would stop at an initramfs prompt."
+		echo "Collect before re-running:"
+		echo "  mdadm --examine <each member>"
+		echo "  blockdev --getsz <each member>"
+		cat /proc/mdstat
+		exit 1
+	fi
+	echo "-- all arrays verified (identity + labels; minors may renumber, that is fine) --"
+fi
 
 echo
 echo "DONE. Reboot into the appliance."

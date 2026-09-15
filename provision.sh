@@ -138,6 +138,20 @@ if [ -n "${FFN_ROOT_PW:-}" ]; then
   echo "root:${FFN_ROOT_PW}" | chpasswd
   echo "${ADMIN_USER}:${FFN_ROOT_PW}" | chpasswd
   echo "  set password for root + ${ADMIN_USER}"
+  # Expire it immediately so the shipped default is SINGLE USE. Every unit built
+  # from one image otherwise shares a password, and provision.sh sets no sshd
+  # policy, so Ubuntu's PasswordAuthentication=yes applies and the default would
+  # work over the network on the admin account. PAM forces a change at the first
+  # login instead -- for root directly, and for ${ADMIN_USER} before the ffn-cli
+  # shell is reached.
+  #
+  # A failure here is warned about, not fatal: an image that boots with a live
+  # password beats no image, but the operator has to know to expire it by hand.
+  if passwd -e root >/dev/null 2>&1 && passwd -e "${ADMIN_USER}" >/dev/null 2>&1; then
+    echo "  expired both -- first login MUST set a new password"
+  else
+    echo "  WARNING: could not expire the default password; it is live until changed"
+  fi
 else
   echo "  WARNING: FFN_ROOT_PW empty -- no console login will be possible"
 fi
@@ -193,7 +207,7 @@ if [ -f /factory-running-config.xml ]; then
   echo "  factory config: model-specific (harvested build-host config discarded)"
 elif [ -f /var/lib/ffn-ngfw/config/running-config.xml ]; then
   cp /var/lib/ffn-ngfw/config/running-config.xml /etc/ffn-ngfw/factory/running-config.xml
-  echo "  WARNING: no profiles/${FFN_MODEL}.running-config.xml -- this image"
+  echo "  WARNING: no profiles/${FFN_MODEL:-<unset>}.running-config.xml -- this image"
   echo "           inherits the BUILD HOST identity as its factory default"
 fi
 
@@ -201,7 +215,12 @@ fi
 # The CP and DP take their rootfs from the MP's SSD over PCIC. Exports are
 # scoped to the PCIC subnet only; NFS must never be reachable from the
 # management network.
+# /opt/ffn-nfs is its own mirrored volume created by install-to-disk.sh; these
+# are the mountpoint directories, shadowed by that mount at runtime. The
+# planes' roots live there rather than on the system partition, so anything
+# they install survives a reboot without competing with the firewall for disk.
 mkdir -p /opt/dpfs /opt/var.cp /opt/var.dp0 /opt/var.dp1 /opt/var.dp2
+mkdir -p /opt/ffn-nfs/cproot /opt/ffn-nfs/dproot
 cat > /etc/exports <<'EOF'
 # FFN: NFS root for the OCTEON control/data planes.
 # Restricted to the CP/DP address space, as PAN-OS does. NFS must never be
@@ -213,6 +232,10 @@ cat > /etc/exports <<'EOF'
 /opt/var.dp0 127.1.0.0/16(rw,sync,no_root_squash,no_subtree_check)
 /opt/var.dp1 127.1.0.0/16(rw,sync,no_root_squash,no_subtree_check)
 /opt/var.dp2 127.1.0.0/16(rw,sync,no_root_squash,no_subtree_check)
+# FFN-built plane roots on the dedicated mirrored volume. Same client
+# scoping: the PCIC subnet only, never the management network.
+/opt/ffn-nfs/cproot 127.1.0.0/16(rw,sync,no_root_squash,no_subtree_check)
+/opt/ffn-nfs/dproot 127.1.0.0/16(rw,sync,no_root_squash,no_subtree_check)
 EOF
 # Pin nfsd to the PCIC subnet. Not a substitute for the firewall rule -- if the
 # PCIC interface is absent at boot nfsd falls back to all addresses, which is

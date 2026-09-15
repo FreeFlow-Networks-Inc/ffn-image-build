@@ -46,10 +46,19 @@ libpam-systemd rsync cloud-guest-utils openssl"
 # fills the 24GB system partition instead.
 export PKGS_STORAGE="mdadm"
 
-export PKGS_NET="nftables iptables ipset conntrack bridge-utils ifenslave frr frr-pythontools \
-libnetfilter-queue1 libnfnetlink0 libhyperscan5 libnuma1 libpcap0.8 libbpf0 libmnl0 \
 # nfs-kernel-server: the OCTEON planes NFS-root from the MP SSD over PCIC,
 # which is what makes the control plane editable in place.
+#
+# KEEP COMMENTS OUTSIDE THIS ASSIGNMENT. Inside a quoted,
+# backslash-continued string a "#" is literal text, not a comment, so the words
+# land in $PKGS_NET and apt reports "Unable to locate package #", "... package
+# OCTEON", one error per word.
+#
+# THIS is the file that matters: build.sh:7 sources it and build.sh:180 copies
+# it into the chroot for provision.sh. payload/config.sh is a staged duplicate,
+# and fixing only that one leaves the build broken in exactly the same way.
+export PKGS_NET="nftables iptables ipset conntrack bridge-utils ifenslave frr frr-pythontools \
+libnetfilter-queue1 libnfnetlink0 libhyperscan5 libnuma1 libpcap0.8 libbpf0 libmnl0 \
 nfs-kernel-server nfs-common"
 # build deps (DPDK/flatcc/venv wheels + FFN C components); kept so runtime HS/pattern compile works
 export PKGS_BUILD="build-essential meson ninja-build cmake git pkg-config python3-pyelftools \
