@@ -633,13 +633,22 @@ class Session:
         return True
 
     @staticmethod
+    def _endpoint(address, port):
+        """ICMP and other port-less flows print the address alone."""
+        return str(address) if port is None else f"{address}:{port}"
+
+    @staticmethod
     def _stream_line(stream):
         """One line stating what the dataplane stream is, never implying readiness it lacks."""
         if not stream:
             return "none on this platform (management-plane connection counters shown)"
         if stream.get("ready"):
-            return (f"ready (fresh, sequence {stream.get('sequence')}, policy revision {stream.get('policy_revision')}, "
-                    f"CP acknowledged: {'yes' if stream.get('cp_acknowledged') else 'no'})")
+            parts = [f"sequence {stream.get('sequence')}"]
+            if stream.get("policy_revision") is not None:
+                parts.append(f"policy revision {stream.get('policy_revision')}")
+            if "cp_acknowledged" in stream:
+                parts.append(f"CP acknowledged: {'yes' if stream.get('cp_acknowledged') else 'no'}")
+            return "ready (fresh, " + ", ".join(parts) + ")"
         return f"UNAVAILABLE ({stream.get('reason') or 'stream not ready'}); management-plane counters shown"
 
     def _show_session_info(self):
@@ -719,10 +728,10 @@ class Session:
         for e in entries:
             nat = "-"
             if (e.get("nat") or {}).get("source") or (e.get("nat") or {}).get("destination"):
-                nat = f"{e.get('xsrc')}:{e.get('xsport')} -> {e.get('xdst')}:{e.get('xdport')}"
+                nat = f"{self._endpoint(e.get('xsrc'), e.get('xsport'))} -> {self._endpoint(e.get('xdst'), e.get('xdport'))}"
             age = e.get("age_seconds")
             rows.append([e.get("short_id"), e.get("vsys") or "-", e.get("protocol"),
-                         f"{e.get('src')}:{e.get('sport')}", f"{e.get('dst')}:{e.get('dport')}", nat,
+                         self._endpoint(e.get('src'), e.get('sport')), self._endpoint(e.get('dst'), e.get('dport')), nat,
                          e.get("rule") or "-", e.get("state_name"), f"{int(age)}s" if age is not None else "-",
                          f"{(e.get('bytes') or {}).get('c2s') or 0}/{(e.get('bytes') or {}).get('s2c') or 0}",
                          e.get("offload")])
@@ -741,9 +750,9 @@ class Session:
         nat = e.get("nat") or {}
         items = [("Identity", e.get("id")), ("Conntrack ID", e.get("ct")), ("vsys", e.get("vsys")), ("Rule", e.get("rule")),
                  ("Protocol", f"{e.get('protocol')} ({e.get('proto')})"),
-                 ("Original (c2s)", f"{e.get('src')}:{e.get('sport')} -> {e.get('dst')}:{e.get('dport')}")]
+                 ("Original (c2s)", f"{self._endpoint(e.get('src'), e.get('sport'))} -> {self._endpoint(e.get('dst'), e.get('dport'))}")]
         if nat.get("source") or nat.get("destination"):
-            items.append(("Translated", f"{e.get('xsrc')}:{e.get('xsport')} -> {e.get('xdst')}:{e.get('xdport')}"))
+            items.append(("Translated", f"{self._endpoint(e.get('xsrc'), e.get('xsport'))} -> {self._endpoint(e.get('xdst'), e.get('xdport'))}"))
         items += [("NAT", f"source {'yes' if nat.get('source') else 'no'}, destination {'yes' if nat.get('destination') else 'no'}"),
                   ("State", e.get("state_name")), ("Age", f"{e.get('age_seconds')}s"), ("Time to live", f"{e.get('ttl')}s"),
                   ("Bytes c2s / s2c", f"{(e.get('bytes') or {}).get('c2s')} / {(e.get('bytes') or {}).get('s2c')}"),
