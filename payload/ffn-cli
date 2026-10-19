@@ -363,6 +363,9 @@ class Session:
                 ("request restart {dataplane|system}", "Restart subsystem"),
                 ("request reload dataplane", "Force ffn-dpd to recompile + push policy"),
                 ("allow zerotier", "Insert top-priority permit rule for zt* interfaces"),
+                ("show session info", "Session table counters, capacity and FE100 offload state"),
+                ("show session all [filter ...]", "Session browser: source|destination|protocol|rule|vsys|offload|count"),
+                ("show session id <id>", "One dataplane session by identity prefix"),
                 ("clear session table", "Flush session table"),
                 ("tail log <name>", "Tail a log file"),
                 ("exit", "Log out of the CLI"),
@@ -399,8 +402,8 @@ class Session:
             return self._show_routing(rest)
         if sub == "arp":
             return self._show_arp()
-        if sub == "sessions":
-            return self._show_sessions()
+        if sub in ("session", "sessions"):
+            return self._show_session(rest)
         if sub == "engines":
             return self._show_engines()
         if sub == "log":
@@ -417,7 +420,7 @@ class Session:
         return True
 
     def _show_usage(self):
-        print("Usage: show <system[ interfaces|platform]|interfaces|routing|arp|sessions|engines|log|config|users|commit-lock|bcm>")
+        print("Usage: show <system[ interfaces|platform]|interfaces|routing|arp|session [info|all|id]|engines|log|config|users|commit-lock|bcm>")
         return True
 
     def _show_system(self, args):
@@ -606,15 +609,155 @@ class Session:
         print_table(["IP", "MAC", "Interface", "State"], rows)
         return True
 
-    def _show_sessions(self):
-        s = api("/api/dashboard/sessions", token=self.token)
-        print_kv([
-            ("Active Sessions", s.get("active", "-")),
-            ("Established", s.get("established", "-")),
-            ("Listen", s.get("listen", "-")),
-            ("Time Wait", s.get("time_wait", "-")),
-            ("Hit Ratio", f"{s.get('hit_ratio', 0)}%"),
-        ])
+    # ---- show session ---------------------------------------------------
+    #
+    # PAN-OS shape: `show session info` for the table's counters, `show session
+    # all` (with filters) for the browser, `show session id` for one session.
+    # On a platform with a dataplane session stream (the PA-5200's FE100
+    # observation feed) all three read that stream's inventory through the
+    # manager, which is also what the WebUI's Session Browser and dashboard
+    # tile show, so the numbers agree everywhere. Without a stream the info
+    # view falls back to the management plane's own connection counters and
+    # says so.
+
+    SESSION_FILTERS = ("source", "destination", "protocol", "rule", "vsys", "offload", "count")
+
+    def _show_session(self, args):
+        if not args or args[0] == "info":
+            return self._show_session_info()
+        if args[0] == "all":
+            return self._show_session_all(args[1:])
+        if args[0] == "id" and len(args) == 2:
+            return self._show_session_id(args[1])
+        print("Usage: show session [info | all [filter <source|destination|protocol|rule|vsys|offload|count> <value> ...] | id <id>]")
+        return True
+
+    @staticmethod
+    def _stream_line(stream):
+        """One line stating what the dataplane stream is, never implying readiness it lacks."""
+        if not stream:
+            return "none on this platform (management-plane connection counters shown)"
+        if stream.get("ready"):
+            return (f"ready (fresh, sequence {stream.get('sequence')}, policy revision {stream.get('policy_revision')}, "
+                    f"CP acknowledged: {'yes' if stream.get('cp_acknowledged') else 'no'})")
+        return f"UNAVAILABLE ({stream.get('reason') or 'stream not ready'}); management-plane counters shown"
+
+    def _show_session_info(self):
+        s = api("/api/dashboard/sessions?breakdown=true", token=self.token)
+        stream = s.get("stream")
+        items = [("Dataplane session stream", self._stream_line(stream))]
+        if stream and stream.get("ready"):
+            maximum = stream.get("max_sessions")
+            items += [
+                ("Number of sessions supported", maximum if maximum else "unknown"),
+                ("Number of active sessions", f"{stream.get('sessions')}  (tcp {stream.get('tcp')}, udp {stream.get('udp')}, other {stream.get('other')})"),
+                ("Session table utilization", f"{stream.get('capacity_percent', 0)}%" if maximum else "-"),
+                ("NAT sessions", f"source {stream.get('nat_source')}, destination {stream.get('nat_destination')}"),
+                ("FE100 offload mode", f"{stream.get('mode')} (hardware admission {'on' if stream.get('hardware_admission') else 'off'})"),
+                ("Software offload candidates", stream.get("software_candidates")),
+                ("L3-ready candidates", stream.get("l3_candidates")),
+                ("Hardware admitted", stream.get("hardware_admitted")),
+                ("Blocked from offload", stream.get("blocked")),
+            ]
+            blockers = stream.get("blockers") or {}
+            for reason, count in list(blockers.items())[:8]:
+                items.append((f"  blocker {reason}", count))
+            breakdown = s.get("breakdown") or {}
+            if breakdown:
+                items.append(("TCP established / other", f"{breakdown.get('tcp_established', 0)} / {breakdown.get('tcp_other', 0)}"))
+        else:
+            items += [
+                ("Active Sessions", s.get("active", "-")),
+                ("Max Sessions", s.get("max_sessions", "-")),
+                ("Established", s.get("established", "-")),
+                ("Listen", s.get("listen", "-")),
+                ("Time Wait", s.get("time_wait", "-")),
+                ("Hit Ratio", f"{s.get('hit_ratio', 0)}%"),
+                ("Source", s.get("source", "-")),
+            ]
+        print_kv(items)
+        return True
+
+    def _show_session_all(self, args):
+        filters = {}
+        if args:
+            if args[0] != "filter" or len(args) % 2 != 1:
+                print("Usage: show session all [filter <source|destination|protocol|rule|vsys|offload|count> <value> ...]")
+                return True
+            for key, value in zip(args[1::2], args[2::2]):
+                if key not in self.SESSION_FILTERS:
+                    print(f"Unknown session filter: {key} (expected one of {', '.join(self.SESSION_FILTERS)})")
+                    return True
+                filters[key] = value
+        count = filters.pop("count", "200")
+        if not count.isdigit() or not 1 <= int(count) <= 5000:
+            print("count must be 1-5000")
+            return True
+        from urllib.parse import urlencode
+        params = {"limit": count}
+        for key, param in (("vsys", "vsys"), ("offload", "offload"), ("protocol", "protocol")):
+            if key in filters:
+                params[param] = filters[key]
+        # One free-text term goes to the server; the others narrow the page here.
+        narrow = {k: filters[k] for k in ("source", "destination", "rule") if k in filters}
+        if narrow:
+            params["q"] = next(iter(narrow.values()))
+        r = api("/api/monitor/sessions?" + urlencode(params), token=self.token)
+        stream = r if r.get("source") == "dataplane-session-stream" else r.get("stream")
+        if not r.get("source") == "dataplane-session-stream":
+            print(color("Dataplane session stream: " + self._stream_line(stream), C.Y))
+            rows = [[e.get("proto"), e.get("local"), e.get("remote"), e.get("state"), e.get("pid"), e.get("process")]
+                    for e in r.get("entries") or []]
+            print_table(["Proto", "Local", "Remote", "State", "PID", "Process"], rows)
+            return True
+        entries = r.get("entries") or []
+        for key, value in narrow.items():
+            field = {"source": "src", "destination": "dst", "rule": "rule"}[key]
+            entries = [e for e in entries if value.lower() in str(e.get(field, "")).lower()
+                       or (key != "rule" and value.lower() in f"{e.get(field)}:{e.get('sport' if key == 'source' else 'dport')}".lower())]
+        rows = []
+        for e in entries:
+            nat = "-"
+            if (e.get("nat") or {}).get("source") or (e.get("nat") or {}).get("destination"):
+                nat = f"{e.get('xsrc')}:{e.get('xsport')} -> {e.get('xdst')}:{e.get('xdport')}"
+            age = e.get("age_seconds")
+            rows.append([e.get("short_id"), e.get("vsys") or "-", e.get("protocol"),
+                         f"{e.get('src')}:{e.get('sport')}", f"{e.get('dst')}:{e.get('dport')}", nat,
+                         e.get("rule") or "-", e.get("state_name"), f"{int(age)}s" if age is not None else "-",
+                         f"{(e.get('bytes') or {}).get('c2s') or 0}/{(e.get('bytes') or {}).get('s2c') or 0}",
+                         e.get("offload")])
+        counters = r.get("counters") or {}
+        print(color(f"Dataplane session stream: {self._stream_line(r)}", C.DIM))
+        print(color(f"{r.get('matched')} of {r.get('total')} sessions match; showing {len(rows)}. "
+                    f"Offload: {counters.get('software_candidates')} candidates, {counters.get('l3_candidates')} L3-ready, "
+                    f"{counters.get('hardware_admitted')} in hardware (observation only), {counters.get('blocked')} blocked.", C.DIM))
+        print_table(["ID", "vsys", "Proto", "Source", "Destination", "NAT", "Rule", "State", "Age", "Bytes c2s/s2c", "Offload"], rows)
+        return True
+
+    def _show_session_id(self, identity):
+        from urllib.parse import quote
+        r = api("/api/monitor/sessions/" + quote(identity, safe=""), token=self.token)
+        e = r.get("session") or {}
+        nat = e.get("nat") or {}
+        items = [("Identity", e.get("id")), ("Conntrack ID", e.get("ct")), ("vsys", e.get("vsys")), ("Rule", e.get("rule")),
+                 ("Protocol", f"{e.get('protocol')} ({e.get('proto')})"),
+                 ("Original (c2s)", f"{e.get('src')}:{e.get('sport')} -> {e.get('dst')}:{e.get('dport')}")]
+        if nat.get("source") or nat.get("destination"):
+            items.append(("Translated", f"{e.get('xsrc')}:{e.get('xsport')} -> {e.get('xdst')}:{e.get('xdport')}"))
+        items += [("NAT", f"source {'yes' if nat.get('source') else 'no'}, destination {'yes' if nat.get('destination') else 'no'}"),
+                  ("State", e.get("state_name")), ("Age", f"{e.get('age_seconds')}s"), ("Time to live", f"{e.get('ttl')}s"),
+                  ("Bytes c2s / s2c", f"{(e.get('bytes') or {}).get('c2s')} / {(e.get('bytes') or {}).get('s2c')}"),
+                  ("Packets c2s / s2c", f"{(e.get('packets') or {}).get('c2s')} / {(e.get('packets') or {}).get('s2c')}"),
+                  ("Offload", e.get("offload")),
+                  ("Software candidate", "yes" if e.get("candidate") else "no"),
+                  ("Blockers", ", ".join(e.get("blockers") or []) or "none")]
+        l3 = e.get("l3")
+        if l3:
+            items += [("L3 plan", "ready" if l3.get("available") else "not ready"),
+                      ("L3 interface pair", " -> ".join(l3.get("pair") or []) or "-"),
+                      ("L3 blockers", ", ".join(l3.get("blockers") or []) or "none")]
+        items.append(("Hardware admission", "none (observation only)"))
+        print_kv(items)
         return True
 
     def _show_engines(self):
